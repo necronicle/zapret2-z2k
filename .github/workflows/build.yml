@@ -495,7 +495,7 @@ jobs:
 
 
   release:
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/tags/v')
     needs: [ build-linux, build-windows, build-freebsd, build-android ]
     permissions:
       contents: write
