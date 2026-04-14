@@ -496,7 +496,11 @@ jobs:
 
   release:
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/tags/v')
-    needs: [ build-linux, build-windows, build-freebsd, build-android ]
+    # z2k fork only uses Linux binaries on routers. Android/FreeBSD/Windows
+    # builds stay in the matrix for parity with upstream but release cuts
+    # as soon as Linux is done — unrelated breakage (e.g. Cygwin mirror
+    # going stale on psmisc source) must not block our Linux releases.
+    needs: [ build-linux ]
     permissions:
       contents: write
     runs-on: ubuntu-latest
