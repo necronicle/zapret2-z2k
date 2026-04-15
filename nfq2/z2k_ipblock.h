@@ -24,6 +24,7 @@
 #include <sys/socket.h>
 
 #include "darkmagic.h"
+#include "conntrack.h"
 
 enum z2k_ipblock_mode {
 	Z2K_IPBLOCK_OFF = 0,
@@ -31,20 +32,18 @@ enum z2k_ipblock_mode {
 };
 
 // Called from the outgoing-packet path in desync.c on every outgoing
-// TCP packet from a ClientHello-carrying flow. Examines whether the
-// current packet is a ClientHello retransmission; if so, increments a
-// per-flow counter and, once the threshold is crossed, fabricates an
-// RST packet flowing from the remote server back to `client` and
-// sends it via `ifclient`.
+// TCP packet. Uses upstream's t_ctrack_position retransmission
+// detector to identify genuine TCP retransmits (not nfqws2 replays
+// of the same packet through the queue). On the Nth confirmed
+// retransmit of a ClientHello flow, fabricates an RST packet with
+// src=server, dst=client and raw-sends it via `ifclient`.
 //
 // Safe to call on every outgoing TCP packet — fast-path returns when
-// the module is disabled, when the packet is not a ClientHello, or
-// when the flow was already finalised. The caller does NOT need to
-// pre-check retransmission.
+// the module is disabled, when the packet is not a ClientHello, when
+// no ctrack is available, or when the flow was already finalised.
 //
-// Return value: true if a client RST was just sent (caller may choose
-// to DROP the current outgoing packet to stop further retransmits
-// propagating), false otherwise.
-bool z2k_ipblock_check_outgoing(const struct dissect *dis,
+// Return value: true if a client RST was just sent, false otherwise.
+bool z2k_ipblock_check_outgoing(t_ctrack *ctrack,
+				const struct dissect *dis,
 				const struct sockaddr *client,
 				const char *ifclient);

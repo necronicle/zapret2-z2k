@@ -1539,7 +1539,7 @@ static uint8_t dpi_desync_tcp_packet_play(
 		// Gated on --ipblock-detect=on (default off). Operates in
 		// parallel with upstream's auto_hostlist_retrans path —
 		// does not share state with it, no conflicts.
-		z2k_ipblock_check_outgoing(dis, (struct sockaddr*)&ps.src, ifin);
+		z2k_ipblock_check_outgoing(ps.ctrack, dis, (struct sockaddr*)&ps.src, ifin);
 
 		// do not detect payload if reasm is in progress
 		if (!ps.ctrack_replay || ReasmIsEmpty(&ps.ctrack_replay->reasm_client))
