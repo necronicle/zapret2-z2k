@@ -2159,6 +2159,31 @@ static uint8_t dpi_desync_packet_play(
 	{
 		packet_debug(!!replay_piece_count, &dis);
 
+		// Phase 6B anti-ТСПУ RST drop filter. Runs before normal
+		// profile dispatch so fake RSTs are suppressed even when no
+		// desync profile would otherwise match. Gate: real packets
+		// only (not replay), TCP with direction deducible from
+		// interface presence. Incoming = ifin set, ifout empty.
+		if (params.rst_filter != RSTFILTER_OFF && !replay_piece_count && dis.tcp)
+		{
+			bool bIncoming = ifin && *ifin && (!ifout || !*ifout);
+			if (bIncoming)
+			{
+				if (dis.tcp->th_flags & TH_RST)
+				{
+					if (rst_filter_should_drop(&dis))
+					{
+						DLOG("rst_filter: verdict DROP on incoming RST\n");
+						return VERDICT_DROP;
+					}
+				}
+				else
+				{
+					rst_filter_note_incoming(&dis);
+				}
+			}
+		}
+
 		// fix csum if unmodified and if OS can pass wrong csum to queue (depends on OS)
 		// modified means we have already fixed the checksum or made it invalid intentionally
 		// this is the only point we VIOLATE const to fix the checksum in the original buffer to avoid copying to mod_pkt

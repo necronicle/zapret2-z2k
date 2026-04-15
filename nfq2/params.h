@@ -8,6 +8,7 @@
 #include "helpers.h"
 #include "sec.h"
 #include "timer.h"
+#include "rstfilter.h"
 
 #include <sys/param.h>
 #include <sys/types.h>
@@ -180,6 +181,12 @@ struct params_s
 	unsigned int ctrack_t_syn, ctrack_t_est, ctrack_t_fin, ctrack_t_udp;
 	t_conntrack conntrack;
 	bool ctrack_disable, server;
+
+	// Phase 6B anti-ТСПУ RST drop filter. OFF by default; z2k enables
+	// it per profile via --rst-filter=on or --rst-filter=aggressive.
+	// Implemented in rstfilter.c — see that file for the three-check
+	// heuristic and design rationale.
+	enum rst_filter_mode rst_filter;
 
 #ifdef HAS_FILTER_SSID
 	bool filter_ssid_present;
