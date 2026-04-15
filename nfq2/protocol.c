@@ -3,6 +3,7 @@
 #include "protocol.h"
 #include "helpers.h"
 #include "params.h"
+#include "z2k_tls_mod.h"
 #include "crypto/sha.h"
 #include "crypto/aes-gcm.h"
 #include "crypto/aes-ctr.h"
@@ -762,6 +763,15 @@ bool TLSMod_parse_list(const char *modlist, struct fake_tls_mod *tls_mod)
 			strncpy(tls_mod->sni, val, sizeof(tls_mod->sni) - 1);
 			tls_mod->sni[sizeof(tls_mod->sni) - 1] = 0;
 		}
+		// Phase 8 — z2k JA3 fingerprint breakers (z2k_tls_mod.c).
+		else if (!strcmp(opt, "z2k_grease"))
+			tls_mod->mod |= FAKE_TLS_MOD_Z2K_GREASE;
+		else if (!strcmp(opt, "z2k_alpn"))
+			tls_mod->mod |= FAKE_TLS_MOD_Z2K_ALPN_FLOOD;
+		else if (!strcmp(opt, "z2k_psk"))
+			tls_mod->mod |= FAKE_TLS_MOD_Z2K_PSK;
+		else if (!strcmp(opt, "z2k_keyshare"))
+			tls_mod->mod |= FAKE_TLS_MOD_Z2K_KEYSHARE;
 		else if (strcmp(opt, "none"))
 			return false;
 
@@ -948,7 +958,14 @@ bool TLSMod(const struct fake_tls_mod *tls_mod, const uint8_t *payload, size_t p
 			}
 		}
 	}
-	
+
+	// Phase 8 — z2k JA3 fingerprint breakers. Runs after all upstream
+	// mods so it operates on the already-mutated buffer. Applies GREASE,
+	// ALPN flood, PSK exchange modes and random key_share extensions
+	// based on the z2k-prefixed flags set in tls_mod->mod.
+	if (!z2k_tls_mod_apply(tls_mod->mod, fake_tls, fake_tls_size, fake_tls_buf_size))
+		return false;
+
 	return true;
 }
 
