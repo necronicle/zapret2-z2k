@@ -62,7 +62,8 @@ typedef struct {
 
 typedef struct rst_filter_entry {
 	rst_filter_key key;
-	bool server_responded;     // heuristic 2 state
+	bool saw_synack;           // server SYN-ACK observed — handshake passed SYN stage
+	bool server_responded;     // any non-RST/non-FIN payload-bearing incoming seen
 	uint8_t server_ttl;        // heuristic 1 state (0 means unknown)
 	uint8_t rst_count;         // heuristic 3 counter
 	time_t last_seen;          // for eviction
@@ -171,14 +172,11 @@ void rst_filter_note_incoming(const struct dissect *dis)
 	if (!dis || !dis->tcp) return;
 	if (params.rst_filter == RSTFILTER_OFF) return;
 
-	// Only meaningful payload-bearing server packets count as
-	// "response" — bare ACKs do not. This avoids flagging legit
-	// zero-window probes or keep-alives as server responses and
-	// disarming heuristic 2 prematurely.
-	if (dis->len_payload == 0) return;
-
-	// Never treat RST/FIN as "response" — their semantics are "close".
 	uint8_t flags = dis->tcp->th_flags;
+
+	// Never treat RST/FIN as "server activity" — those are close
+	// semantics, not liveness. Caller already filters RST out; we
+	// double-check FIN here for safety.
 	if (flags & (TH_RST | TH_FIN)) return;
 
 	rst_filter_key key;
@@ -190,7 +188,23 @@ void rst_filter_note_incoming(const struct dissect *dis)
 	rst_filter_entry *e = find_or_create(&key, true);
 	if (!e) return;
 
-	e->server_responded = true;
+	// SYN-ACK proves the server accepted the SYN and TCP state passed
+	// the first stage. A subsequent RST without any payload activity
+	// is then suspicious (see heuristic 2 in rst_filter_should_drop).
+	// We must distinguish this from closed-port RSTs where SYN is met
+	// by an RST directly — in that case saw_synack stays false and
+	// heuristic 2 is suppressed, letting the legit RST through.
+	if ((flags & (TH_SYN | TH_ACK)) == (TH_SYN | TH_ACK))
+		e->saw_synack = true;
+
+	// Payload-bearing incoming packets (data, not bare ACKs) count
+	// as "server responded". Used by heuristic 2 as an even stronger
+	// signal than SYN-ACK alone.
+	if (dis->len_payload > 0)
+		e->server_responded = true;
+
+	// Capture the legit server TTL on the first incoming packet so
+	// heuristic 1 has a reference to compare against.
 	if (!e->server_ttl) e->server_ttl = ttl46(dis->ip, dis->ip6);
 	e->last_seen = now;
 }
@@ -217,11 +231,17 @@ bool rst_filter_should_drop(const struct dissect *dis)
 	e->last_seen = now;
 
 	// ------------------------------------------------------------------
-	// Heuristic 2 — RST before any server response.
+	// Heuristic 2 — RST before any server data, but ONLY after a
+	// legitimate SYN-ACK has been observed. Gating on saw_synack is
+	// what distinguishes this from legit closed-port RSTs, where the
+	// server never sends SYN-ACK at all and must be allowed to refuse
+	// the connection cleanly. Once we have SYN-ACK, the flow moved
+	// past SYN_SENT and a subsequent RST without any payload is
+	// classic DPI mid-handshake injection.
 	// ------------------------------------------------------------------
-	if (!e->server_responded) {
-		DLOG("rst_filter: DROP — RST before any server response "
-		     "(count=%u)\n", e->rst_count);
+	if (e->saw_synack && !e->server_responded) {
+		DLOG("rst_filter: DROP — RST after SYN-ACK but before any "
+		     "server data (count=%u)\n", e->rst_count);
 		return true;
 	}
 
