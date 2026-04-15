@@ -62,8 +62,7 @@ typedef struct {
 
 typedef struct z2k_ipblock_entry {
 	z2k_ipblock_key key;
-	uint32_t first_seq;           // seq of first ClientHello seen
-	uint8_t retrans_count;        // duplicate-seq count after the first
+	uint8_t retrans_count;        // confirmed retransmits seen (upstream detector)
 	bool finalized;               // client RST already sent — do not re-fire
 	time_t last_seen;
 	UT_hash_handle hh;
@@ -184,19 +183,38 @@ static bool send_rst_to_client(const struct dissect *dis,
 	return rawsend(client, 0, ifclient, pkt, pktlen);
 }
 
+// Mirror of desync.c's static is_retransmission helper. Kept private to
+// this file so it can run without touching upstream's desync.c API.
+static inline bool z2k_is_retransmission(const t_ctrack_position *pos)
+{
+	return !((pos->uppos_prev - pos->pos) & 0x80000000);
+}
+
 // --- Public API ------------------------------------------------------------
 
-bool z2k_ipblock_check_outgoing(const struct dissect *dis,
+bool z2k_ipblock_check_outgoing(t_ctrack *ctrack,
+				const struct dissect *dis,
 				const struct sockaddr *client,
 				const char *ifclient)
 {
 	if (params.z2k_ipblock_detect == Z2K_IPBLOCK_OFF) return false;
 	if (!dis || !dis->tcp) return false;
+	if (!ctrack) return false;
 
 	// Only act on outgoing packets that actually carry a TLS
 	// ClientHello — the whole point is to catch stuck handshakes.
 	if (dis->len_payload == 0) return false;
 	if (!IsTLSClientHelloPartial(dis->data_payload, dis->len_payload))
+		return false;
+
+	// Skip packets that sit in the SYN stage — handshake not even
+	// started, nothing to declare blocked yet.
+	if (ctrack->pos.state == SYN) return false;
+
+	// Use upstream's retransmission detector on the client-direction
+	// position. Avoids the nfqws2 replay mechanism false-positives
+	// that a naive seq-equality check would suffer from.
+	if (!z2k_is_retransmission(&ctrack->pos.client))
 		return false;
 
 	z2k_ipblock_key key;
@@ -209,36 +227,15 @@ bool z2k_ipblock_check_outgoing(const struct dissect *dis,
 	if (!e) return false;
 
 	e->last_seen = now;
-	uint32_t seq = ntohl(dis->tcp->th_seq);
 
 	if (e->finalized) {
-		// Already fired the client RST on this flow — do nothing
-		// further so we don't spam. The state hangs around for
-		// eviction but stays quiescent.
+		// Already fired the client RST on this flow — silent
+		// afterwards so we don't spam multiple resets.
 		return false;
 	}
 
-	if (e->retrans_count == 0) {
-		// First ClientHello seen on this flow. Record its seq;
-		// real retransmissions will arrive with the same seq.
-		e->first_seq = seq;
-		e->retrans_count = 1;
-		return false;
-	}
-
-	if (seq != e->first_seq) {
-		// Different seq — this is not a retransmission, it's a
-		// second ClientHello on the same flow (TLS session
-		// resumption, HelloRetryRequest, etc). Reset tracking so
-		// we don't false-trigger.
-		e->first_seq = seq;
-		e->retrans_count = 1;
-		return false;
-	}
-
-	// Same seq as before — retransmission.
 	e->retrans_count++;
-	DLOG("z2k_ipblock: ClientHello retrans %u/%u\n",
+	DLOG("z2k_ipblock: confirmed ClientHello retrans %u/%u\n",
 	     e->retrans_count, Z2K_IPBLOCK_THRESHOLD);
 
 	if (e->retrans_count < Z2K_IPBLOCK_THRESHOLD) return false;
