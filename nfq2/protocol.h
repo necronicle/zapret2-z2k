@@ -141,6 +141,13 @@ struct fake_tls_mod
 #define FAKE_TLS_MOD_SNI		0x04
 #define FAKE_TLS_MOD_DUP_SID		0x08
 #define FAKE_TLS_MOD_PADENCAP		0x10
+// Phase 8 — z2k JA3 fingerprint breakers. Implementation in z2k_tls_mod.c.
+// Applied after the upstream mods in TLSMod() so they operate on the
+// already-mutated ClientHello.
+#define FAKE_TLS_MOD_Z2K_GREASE		0x20
+#define FAKE_TLS_MOD_Z2K_ALPN_FLOOD	0x40
+#define FAKE_TLS_MOD_Z2K_PSK		0x80
+#define FAKE_TLS_MOD_Z2K_KEYSHARE	0x100
 
 bool TLSMod_parse_list(const char *modlist, struct fake_tls_mod *tls_mod);
 bool TLSMod(const struct fake_tls_mod *tls_mod, const uint8_t *payload, size_t payload_len, uint8_t *fake_tls, size_t *fake_tls_size, size_t fake_tls_buf_size);
