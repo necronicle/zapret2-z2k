@@ -1531,6 +1531,15 @@ static uint8_t dpi_desync_tcp_packet_play(
 
 		process_retrans_fail(ps.ctrack, dis, (struct sockaddr*)&ps.src, ifin);
 
+		// Phase 9 — z2k IP block detection. Watches for repeated
+		// ClientHello retransmissions on the same flow and, on
+		// threshold, emits a RST from server->client so the app
+		// fails fast and retries on a different A-record IP.
+		// Gated on --ipblock-detect=on (default off). Operates in
+		// parallel with upstream's auto_hostlist_retrans path —
+		// does not share state with it, no conflicts.
+		z2k_ipblock_check_outgoing(dis, (struct sockaddr*)&ps.src, ifin);
+
 		// do not detect payload if reasm is in progress
 		if (!ps.ctrack_replay || ReasmIsEmpty(&ps.ctrack_replay->reasm_client))
 		{

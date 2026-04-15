@@ -9,6 +9,7 @@
 #include "sec.h"
 #include "timer.h"
 #include "rstfilter.h"
+#include "z2k_ipblock.h"
 
 #include <sys/param.h>
 #include <sys/types.h>
@@ -185,6 +186,11 @@ struct params_s
 	// Implemented in rstfilter.c — see that file for the three-check
 	// heuristic and design rationale.
 	enum rst_filter_mode rst_filter;
+
+	// Phase 9 anti-ТСПУ IP-block detection + fast client RST.
+	// OFF by default; z2k enables via --ipblock-detect=on.
+	// Implemented in z2k_ipblock.c.
+	enum z2k_ipblock_mode z2k_ipblock_detect;
 
 #ifdef HAS_FILTER_SSID
 	bool filter_ssid_present;
