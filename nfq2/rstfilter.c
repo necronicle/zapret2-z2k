@@ -41,6 +41,22 @@
 // every packet.
 #define RST_FILTER_PURGE_INTERVAL_SEC     30
 
+// Hard cap on the number of flow-state entries held in the pool.
+//
+// Each entry is ~100 bytes (key + flags + uthash handle overhead). At cap
+// the pool itself tops out around 400 KB which is acceptable even on
+// 64 MB Keenetic-class MIPS boxes. Beyond this number we assume the pool
+// is being saturated by either a sustained traffic burst or a pathological
+// port-scan, and start LRU-evicting the least-recently-seen entries so
+// that actively-tracked flows (those with fresh last_seen) keep their
+// state and the feature continues to work for them.
+//
+// If every entry in the pool is "fresh" (hot traffic) and we still cannot
+// make room, the new flow is left untracked — its RSTs will fall through
+// unfiltered, which is graceful feature degradation rather than a crash
+// or a silent OOM kill later.
+#define RST_FILTER_MAX_ENTRIES            4096
+
 // --- Data model ------------------------------------------------------------
 
 typedef struct {
@@ -71,6 +87,7 @@ typedef struct rst_filter_entry {
 } rst_filter_entry;
 
 static rst_filter_entry *pool = NULL;
+static unsigned int pool_size = 0;
 static time_t last_purge = 0;
 
 // --- Helpers ---------------------------------------------------------------
@@ -114,28 +131,6 @@ static size_t key_size(const rst_filter_key *k)
 	return sizeof(rst_filter_key);
 }
 
-static rst_filter_entry *find_or_create(const rst_filter_key *key, bool create)
-{
-	rst_filter_entry *e = NULL;
-	HASH_FIND(hh, pool, key, key_size(key), e);
-	if (e || !create) return e;
-
-	e = (rst_filter_entry *)calloc(1, sizeof(*e));
-	if (!e) {
-		DLOG_ERR("rst_filter: calloc failed\n");
-		return NULL;
-	}
-	e->key = *key;
-	HASH_ADD(hh, pool, key, key_size(key), e);
-	if (!e->hh.tbl) {
-		// uthash in non-fatal OOM mode: if hh.tbl is NULL the add
-		// silently failed. Release the orphan and bail.
-		free(e);
-		return NULL;
-	}
-	return e;
-}
-
 static void purge_if_due(time_t now)
 {
 	if (now - last_purge < RST_FILTER_PURGE_INTERVAL_SEC) return;
@@ -150,7 +145,71 @@ static void purge_if_due(time_t now)
 			removed++;
 		}
 	}
-	if (removed) DLOG("rst_filter: purged %u stale entries\n", removed);
+	if (removed) {
+		pool_size -= removed;
+		DLOG("rst_filter: purged %u stale entries (pool=%u)\n",
+		     removed, pool_size);
+	}
+}
+
+// Remove the single oldest entry (lowest last_seen). Linear scan, only
+// invoked when the pool hits RST_FILTER_MAX_ENTRIES — which under normal
+// traffic should be very rare. Returns true if an entry was freed.
+static bool evict_oldest_one(void)
+{
+	rst_filter_entry *e, *tmp, *victim = NULL;
+	HASH_ITER(hh, pool, e, tmp) {
+		if (!victim || e->last_seen < victim->last_seen)
+			victim = e;
+	}
+	if (!victim) return false;
+	HASH_DEL(pool, victim);
+	free(victim);
+	pool_size--;
+	return true;
+}
+
+static rst_filter_entry *find_or_create(const rst_filter_key *key, bool create)
+{
+	rst_filter_entry *e = NULL;
+	HASH_FIND(hh, pool, key, key_size(key), e);
+	if (e || !create) return e;
+
+	// Pool cap: force a purge even if not time-due, then LRU-evict if
+	// still full. Under normal traffic this branch is cold — purge
+	// ticks every 30 s and idle entries age out at 120 s.
+	if (pool_size >= RST_FILTER_MAX_ENTRIES) {
+		last_purge = 0; // force purge_if_due to fire
+		purge_if_due(time(NULL));
+		while (pool_size >= RST_FILTER_MAX_ENTRIES) {
+			if (!evict_oldest_one()) break;
+		}
+		if (pool_size >= RST_FILTER_MAX_ENTRIES) {
+			// Somehow still full (shouldn't happen — evict_oldest_one
+			// only fails on an empty pool). Leave the new flow
+			// untracked; its RSTs fall through unfiltered rather
+			// than trigger a silent OOM later.
+			DLOG("rst_filter: pool full (%u), skipping new flow\n",
+			     pool_size);
+			return NULL;
+		}
+	}
+
+	e = (rst_filter_entry *)calloc(1, sizeof(*e));
+	if (!e) {
+		DLOG_ERR("rst_filter: calloc failed\n");
+		return NULL;
+	}
+	e->key = *key;
+	HASH_ADD(hh, pool, key, key_size(key), e);
+	if (!e->hh.tbl) {
+		// uthash in non-fatal OOM mode: if hh.tbl is NULL the add
+		// silently failed. Release the orphan and bail.
+		free(e);
+		return NULL;
+	}
+	pool_size++;
+	return e;
 }
 
 static uint8_t current_tolerance(void)
