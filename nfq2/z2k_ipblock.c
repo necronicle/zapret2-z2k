@@ -41,6 +41,15 @@
 // on every packet.
 #define Z2K_IPBLOCK_PURGE_INTERVAL_SEC	30
 
+// Hard cap on flow-state entries. Same rationale as rstfilter.c — an
+// unbounded pool under sustained ClientHello-retransmit bursts (e.g.
+// heavy page reloads on blocked sites) could grow to megabytes on a
+// 64 MB MIPS box. 4096 entries × ~100 B = ~400 KB worst case. Beyond
+// the cap we LRU-evict the oldest entry (lowest last_seen) so active
+// flows retain their retrans_count through the threshold check, then
+// fall back to leaving the new flow untracked rather than risk OOM.
+#define Z2K_IPBLOCK_MAX_ENTRIES		4096
+
 // --- Data model ------------------------------------------------------------
 
 typedef struct {
@@ -69,6 +78,7 @@ typedef struct z2k_ipblock_entry {
 } z2k_ipblock_entry;
 
 static z2k_ipblock_entry *pool = NULL;
+static unsigned int pool_size = 0;
 static time_t last_purge = 0;
 
 // --- Helpers ---------------------------------------------------------------
@@ -110,7 +120,28 @@ static void purge_if_due(time_t now)
 			removed++;
 		}
 	}
-	if (removed) DLOG("z2k_ipblock: purged %u stale entries\n", removed);
+	if (removed) {
+		pool_size -= removed;
+		DLOG("z2k_ipblock: purged %u stale entries (pool=%u)\n",
+		     removed, pool_size);
+	}
+}
+
+// Remove the single oldest entry (lowest last_seen). Linear scan — only
+// invoked when the pool hits the cap, which should be rare under normal
+// traffic. Returns true if an entry was freed.
+static bool evict_oldest_one(void)
+{
+	z2k_ipblock_entry *e, *tmp, *victim = NULL;
+	HASH_ITER(hh, pool, e, tmp) {
+		if (!victim || e->last_seen < victim->last_seen)
+			victim = e;
+	}
+	if (!victim) return false;
+	HASH_DEL(pool, victim);
+	free(victim);
+	pool_size--;
+	return true;
 }
 
 static z2k_ipblock_entry *find_or_create(const z2k_ipblock_key *key)
@@ -118,6 +149,26 @@ static z2k_ipblock_entry *find_or_create(const z2k_ipblock_key *key)
 	z2k_ipblock_entry *e = NULL;
 	HASH_FIND(hh, pool, key, sizeof(z2k_ipblock_key), e);
 	if (e) return e;
+
+	// Pool cap: force a purge even if not time-due, then LRU-evict if
+	// still full. Cold path under normal traffic — purge ticks every
+	// 30 s and idle entries age out at 180 s.
+	if (pool_size >= Z2K_IPBLOCK_MAX_ENTRIES) {
+		last_purge = 0; // force purge_if_due to fire
+		purge_if_due(time(NULL));
+		while (pool_size >= Z2K_IPBLOCK_MAX_ENTRIES) {
+			if (!evict_oldest_one()) break;
+		}
+		if (pool_size >= Z2K_IPBLOCK_MAX_ENTRIES) {
+			// Pool saturated by active flows. Leave the new flow
+			// untracked — its retrans will not reach the threshold
+			// check, so no RST will be synthesised for it. Graceful
+			// feature degradation rather than risking OOM.
+			DLOG("z2k_ipblock: pool full (%u), skipping new flow\n",
+			     pool_size);
+			return NULL;
+		}
+	}
 
 	e = (z2k_ipblock_entry *)calloc(1, sizeof(*e));
 	if (!e) {
@@ -130,6 +181,7 @@ static z2k_ipblock_entry *find_or_create(const z2k_ipblock_key *key)
 		free(e);
 		return NULL;
 	}
+	pool_size++;
 	return e;
 }
 
