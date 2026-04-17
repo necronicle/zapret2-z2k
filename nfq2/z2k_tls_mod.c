@@ -81,14 +81,21 @@ static inline void wr_u24(uint8_t *p, uint32_t v)
 // Append a single TLS extension (type + length + data) to the end of the
 // fake ClientHello's extensions block and update the three length headers.
 // Returns true on success, false on overflow / parse failure.
+//
+// `extlen_offset` is passed in from the dispatcher so the caller can
+// amortise one TLSFindExtLen() scan across multiple appends. The
+// extensions-block starts at a fixed offset inside the handshake (after
+// the ClientVersion/Random/SessionID/CipherSuites/CompressionMethods
+// fields), so appending new extensions never shifts that offset — only
+// the length value at extlen_offset needs to be bumped.
 static bool z2k_tls_append_ext(uint8_t *fake_tls,
 			       size_t *fake_tls_size,
 			       size_t fake_tls_buf_size,
+			       size_t extlen_offset,
 			       uint16_t ext_type,
 			       const uint8_t *ext_data,
 			       size_t ext_data_len)
 {
-	size_t extlen_offset = 0;
 	size_t add = 4 + ext_data_len; // 2 bytes type + 2 bytes length + data
 	size_t new_size = *fake_tls_size + add;
 
@@ -96,11 +103,6 @@ static bool z2k_tls_append_ext(uint8_t *fake_tls,
 		DLOG_ERR("z2k_tls_mod: overflow appending ext type=0x%04x "
 			 "size=%zu buf=%zu\n", ext_type, new_size,
 			 fake_tls_buf_size);
-		return false;
-	}
-
-	if (!TLSFindExtLen(fake_tls, *fake_tls_size, &extlen_offset)) {
-		DLOG_ERR("z2k_tls_mod: cannot locate extensions length\n");
 		return false;
 	}
 
@@ -140,7 +142,8 @@ static uint16_t random_grease_value(void)
 }
 
 static bool z2k_tls_mod_grease(uint8_t *fake_tls, size_t *fake_tls_size,
-			       size_t fake_tls_buf_size)
+			       size_t fake_tls_buf_size,
+			       size_t extlen_offset)
 {
 	// Two random padding bytes as body. Keeps the extension short and
 	// RFC-compliant — servers always ignore GREASE values.
@@ -148,7 +151,7 @@ static bool z2k_tls_mod_grease(uint8_t *fake_tls, size_t *fake_tls_size,
 	data[0] = (uint8_t)(random() & 0xff);
 	data[1] = (uint8_t)(random() & 0xff);
 	bool ok = z2k_tls_append_ext(fake_tls, fake_tls_size,
-				     fake_tls_buf_size,
+				     fake_tls_buf_size, extlen_offset,
 				     random_grease_value(),
 				     data, sizeof(data));
 	if (ok) DLOG("z2k_tls_mod: applied grease\n");
@@ -156,7 +159,8 @@ static bool z2k_tls_mod_grease(uint8_t *fake_tls, size_t *fake_tls_size,
 }
 
 static bool z2k_tls_mod_alpn_flood(uint8_t *fake_tls, size_t *fake_tls_size,
-				   size_t fake_tls_buf_size)
+				   size_t fake_tls_buf_size,
+				   size_t extlen_offset)
 {
 	// Build ALPN ext body: u16 list_length, then N strings each with a
 	// u8 length prefix. 14 protocols is enough to dramatically distort
@@ -178,7 +182,7 @@ static bool z2k_tls_mod_alpn_flood(uint8_t *fake_tls, size_t *fake_tls_size,
 	wr_u16(body, (uint16_t)(off - 2));
 
 	bool ok = z2k_tls_append_ext(fake_tls, fake_tls_size,
-				     fake_tls_buf_size,
+				     fake_tls_buf_size, extlen_offset,
 				     0x0010, // application_layer_protocol_negotiation
 				     body, off);
 	if (ok) DLOG("z2k_tls_mod: applied alpn_flood (%zu protocols)\n",
@@ -187,7 +191,8 @@ static bool z2k_tls_mod_alpn_flood(uint8_t *fake_tls, size_t *fake_tls_size,
 }
 
 static bool z2k_tls_mod_psk(uint8_t *fake_tls, size_t *fake_tls_size,
-			    size_t fake_tls_buf_size)
+			    size_t fake_tls_buf_size,
+			    size_t extlen_offset)
 {
 	// psk_key_exchange_modes body: u8 ke_modes_length, then ke_modes.
 	// Mode 0x00 = psk_ke, 0x01 = psk_dhe_ke (TLS 1.3 standard).
@@ -197,7 +202,7 @@ static bool z2k_tls_mod_psk(uint8_t *fake_tls, size_t *fake_tls_size,
 	body[2] = 0x01; // psk_dhe_ke
 
 	bool ok = z2k_tls_append_ext(fake_tls, fake_tls_size,
-				     fake_tls_buf_size,
+				     fake_tls_buf_size, extlen_offset,
 				     0x002d, // psk_key_exchange_modes
 				     body, sizeof(body));
 	if (ok) DLOG("z2k_tls_mod: applied psk (key exchange modes)\n");
@@ -205,7 +210,8 @@ static bool z2k_tls_mod_psk(uint8_t *fake_tls, size_t *fake_tls_size,
 }
 
 static bool z2k_tls_mod_keyshare(uint8_t *fake_tls, size_t *fake_tls_size,
-				 size_t fake_tls_buf_size)
+				 size_t fake_tls_buf_size,
+				 size_t extlen_offset)
 {
 	// key_share extension body:
 	//   u16 client_shares_len
@@ -226,7 +232,7 @@ static bool z2k_tls_mod_keyshare(uint8_t *fake_tls, size_t *fake_tls_size,
 	memcpy(body + 6, key, 32);
 
 	bool ok = z2k_tls_append_ext(fake_tls, fake_tls_size,
-				     fake_tls_buf_size,
+				     fake_tls_buf_size, extlen_offset,
 				     0x0033, // key_share
 				     body, sizeof(body));
 	if (ok) DLOG("z2k_tls_mod: applied keyshare (random x25519)\n");
@@ -256,20 +262,37 @@ bool z2k_tls_mod_apply(uint32_t mod_bits, uint8_t *fake_tls,
 		return false;
 	}
 
+	// Locate the extensions-length field once and thread it through the
+	// mod chain. Extensions live at a fixed offset inside the ClientHello
+	// record (after Version / Random / SessionID / CipherSuites /
+	// CompressionMethods), and appending new extensions never moves that
+	// offset — only the u16 value at it changes. Before this cache each
+	// mod re-walked the record via TLSFindExtLen(); with all 4 flags set
+	// that was 4× redundant scans per fake packet on the MIPS hot path.
+	size_t extlen_offset = 0;
+	if (!TLSFindExtLen(fake_tls, *fake_tls_size, &extlen_offset)) {
+		DLOG_ERR("z2k_tls_mod: cannot locate extensions length\n");
+		return false;
+	}
+
 	if (mod_bits & FAKE_TLS_MOD_Z2K_GREASE)
-		if (!z2k_tls_mod_grease(fake_tls, fake_tls_size, fake_tls_buf_size))
+		if (!z2k_tls_mod_grease(fake_tls, fake_tls_size,
+					fake_tls_buf_size, extlen_offset))
 			return false;
 
 	if (mod_bits & FAKE_TLS_MOD_Z2K_ALPN_FLOOD)
-		if (!z2k_tls_mod_alpn_flood(fake_tls, fake_tls_size, fake_tls_buf_size))
+		if (!z2k_tls_mod_alpn_flood(fake_tls, fake_tls_size,
+					    fake_tls_buf_size, extlen_offset))
 			return false;
 
 	if (mod_bits & FAKE_TLS_MOD_Z2K_PSK)
-		if (!z2k_tls_mod_psk(fake_tls, fake_tls_size, fake_tls_buf_size))
+		if (!z2k_tls_mod_psk(fake_tls, fake_tls_size,
+				     fake_tls_buf_size, extlen_offset))
 			return false;
 
 	if (mod_bits & FAKE_TLS_MOD_Z2K_KEYSHARE)
-		if (!z2k_tls_mod_keyshare(fake_tls, fake_tls_size, fake_tls_buf_size))
+		if (!z2k_tls_mod_keyshare(fake_tls, fake_tls_size,
+					  fake_tls_buf_size, extlen_offset))
 			return false;
 
 	return true;
