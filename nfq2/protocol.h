@@ -148,6 +148,15 @@ struct fake_tls_mod
 #define FAKE_TLS_MOD_Z2K_ALPN_FLOOD	0x40
 #define FAKE_TLS_MOD_Z2K_PSK		0x80
 #define FAKE_TLS_MOD_Z2K_KEYSHARE	0x100
+// r2 (2026-05-03): non-conflicting extensions for stronger JA3 distortion
+// after dup-skip on alpn/psk/keyshare neutered our impact для blob'ов
+// которые уже содержат стандартные extensions. Эти 4 редко присутствуют
+// в Chrome/Firefox/Safari ClientHello, так что append почти всегда
+// shifts JA3 hash.
+#define FAKE_TLS_MOD_Z2K_EARLYDATA	0x200	// 0x002a — TLS 1.3 0-RTT
+#define FAKE_TLS_MOD_Z2K_PHA		0x400	// 0x0031 — post_handshake_auth
+#define FAKE_TLS_MOD_Z2K_SCT		0x800	// 0x0012 — signed_certificate_timestamp
+#define FAKE_TLS_MOD_Z2K_DELEGCRED	0x1000	// 0x0022 — delegated_credentials
 
 bool TLSMod_parse_list(const char *modlist, struct fake_tls_mod *tls_mod);
 bool TLSMod(const struct fake_tls_mod *tls_mod, const uint8_t *payload, size_t payload_len, uint8_t *fake_tls, size_t *fake_tls_size, size_t fake_tls_buf_size);
