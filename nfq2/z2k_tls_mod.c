@@ -76,6 +76,33 @@ static inline void wr_u24(uint8_t *p, uint32_t v)
 	p[2] = (uint8_t)(v & 0xff);
 }
 
+// --- Extension presence check --------------------------------------------
+
+// Walks the extensions block of fake ClientHello looking for an extension
+// of given type. Returns true if found. RFC 8446 §4.2 strictly forbids
+// duplicate extensions in a single ClientHello — server MUST reject with
+// "decoded_error" alert. Modern blobs (Chrome / Firefox / Safari) already
+// contain ALPN / key_share / psk_key_exchange_modes — appending our z2k_*
+// versions without this check produces malformed handshakes that strict
+// peers (Cloudflare прежде всего) reject silently.
+static bool z2k_tls_has_ext(const uint8_t *fake_tls, size_t fake_tls_size,
+			    size_t extlen_offset, uint16_t ext_type)
+{
+	if (extlen_offset + 2 > fake_tls_size) return false;
+	uint16_t ext_block_len = rd_u16(fake_tls + extlen_offset);
+	const uint8_t *p = fake_tls + extlen_offset + 2;
+	const uint8_t *end = p + ext_block_len;
+	if (end > fake_tls + fake_tls_size) end = fake_tls + fake_tls_size;
+	while (p + 4 <= end) {
+		uint16_t type = rd_u16(p);
+		uint16_t len  = rd_u16(p + 2);
+		if (type == ext_type) return true;
+		if (p + 4 + len > end) break;
+		p += 4 + len;
+	}
+	return false;
+}
+
 // --- Core append helper ---------------------------------------------------
 
 // Append a single TLS extension (type + length + data) to the end of the
@@ -162,6 +189,14 @@ static bool z2k_tls_mod_alpn_flood(uint8_t *fake_tls, size_t *fake_tls_size,
 				   size_t fake_tls_buf_size,
 				   size_t extlen_offset)
 {
+	// RFC 8446 §4.2: duplicate extensions of same type are illegal — strict
+	// peers (Cloudflare) reject with decode_error alert. Chrome/Firefox/Safari
+	// blobs already advertise ALPN, so silently skip if present.
+	if (z2k_tls_has_ext(fake_tls, *fake_tls_size, extlen_offset, 0x0010)) {
+		DLOG("z2k_tls_mod: skip alpn_flood — ALPN already in ClientHello\n");
+		return true;
+	}
+
 	// Build ALPN ext body: u16 list_length, then N strings each with a
 	// u8 length prefix. 14 protocols is enough to dramatically distort
 	// any fingerprint that hashes ALPN list+order.
@@ -194,6 +229,12 @@ static bool z2k_tls_mod_psk(uint8_t *fake_tls, size_t *fake_tls_size,
 			    size_t fake_tls_buf_size,
 			    size_t extlen_offset)
 {
+	// RFC 8446 §4.2 duplicate-check (see z2k_tls_mod_alpn_flood).
+	if (z2k_tls_has_ext(fake_tls, *fake_tls_size, extlen_offset, 0x002d)) {
+		DLOG("z2k_tls_mod: skip psk — psk_key_exchange_modes already in ClientHello\n");
+		return true;
+	}
+
 	// psk_key_exchange_modes body: u8 ke_modes_length, then ke_modes.
 	// Mode 0x00 = psk_ke, 0x01 = psk_dhe_ke (TLS 1.3 standard).
 	uint8_t body[3];
@@ -213,6 +254,12 @@ static bool z2k_tls_mod_keyshare(uint8_t *fake_tls, size_t *fake_tls_size,
 				 size_t fake_tls_buf_size,
 				 size_t extlen_offset)
 {
+	// RFC 8446 §4.2 duplicate-check.
+	if (z2k_tls_has_ext(fake_tls, *fake_tls_size, extlen_offset, 0x0033)) {
+		DLOG("z2k_tls_mod: skip keyshare — key_share already in ClientHello\n");
+		return true;
+	}
+
 	// key_share extension body:
 	//   u16 client_shares_len
 	//   [
@@ -220,11 +267,26 @@ static bool z2k_tls_mod_keyshare(uint8_t *fake_tls, size_t *fake_tls_size,
 	//     u16 key_exchange_len
 	//     <key_exchange>
 	//   ]
-	// We advertise one entry with a random 32-byte x25519-sized key.
+	// We advertise one entry with a random x25519 public key.
+	//
+	// RFC 7748 §5: x25519 public keys MUST be clamped — random 32 bytes
+	// is invalid as Curve25519 point and strict TLS 1.3 implementations
+	// reject the handshake. Apply standard clamp:
+	//   key[0]  &= 0xF8   (clear bottom 3 bits)
+	//   key[31] &= 0x7F   (clear top bit)
+	//   key[31] |= 0x40   (set second-top bit)
+	// Result is a uniformly-random scalar in the valid x25519 subset.
+	// Server actually computes ECDH against this, but since we only care
+	// the handshake passes the syntactic gate (protocol-level cap from
+	// our fake never reaches server's crypto layer due to badsum/tcp_md5),
+	// any clamped 32-byte value works.
 	uint8_t body[2 + 2 + 2 + 32];
 	uint8_t key[32];
 	for (size_t i = 0; i < sizeof(key); i++)
 		key[i] = (uint8_t)(random() & 0xff);
+	key[0]  &= 0xF8;
+	key[31] &= 0x7F;
+	key[31] |= 0x40;
 
 	wr_u16(body + 0, 2 + 2 + 32);   // client_shares_len
 	wr_u16(body + 2, 0x001d);       // group x25519
@@ -235,7 +297,7 @@ static bool z2k_tls_mod_keyshare(uint8_t *fake_tls, size_t *fake_tls_size,
 				     fake_tls_buf_size, extlen_offset,
 				     0x0033, // key_share
 				     body, sizeof(body));
-	if (ok) DLOG("z2k_tls_mod: applied keyshare (random x25519)\n");
+	if (ok) DLOG("z2k_tls_mod: applied keyshare (clamped x25519)\n");
 	return ok;
 }
 
