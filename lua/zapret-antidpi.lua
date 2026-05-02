@@ -449,13 +449,37 @@ function fake(ctx, desync)
 				return
 			end
 			local fake_payload = blob(desync, desync.arg.blob)
-			if desync.reasm_data and desync.arg.tls_mod then
-				local pl = tls_mod_shim(desync, fake_payload, desync.arg.tls_mod, desync.reasm_data)
-				if pl then fake_payload = pl end
+			-- Per-attempt TLSMod rotation (z2k v0.9.5.1-z2k-r1).
+			-- При repeats > 1 + tls_mod, ТСПУ запоминает fingerprint первого
+			-- fake-пакета и игнорит остальные repeats с тем же модификатором
+			-- (ntc.party 22516 #84). Раньше TLSMod() вызывался один раз перед
+			-- rawsend_rep — все N repeats были байт-идентичны. Чтобы получить
+			-- N разных fingerprint'ов: разворачиваем repeats в lua-loop, каждая
+			-- итерация перевызывает tls_mod_shim для fresh randomization
+			-- (rnd/rndsni/padencap pad randomized per call). dupsid читает
+			-- payload (immutable across iterations) → SessionID consistent.
+			-- Force repeats=1 inside loop чтобы C-rawsend_rep не множил
+			-- каждую итерацию ещё раз.
+			local repeats = tonumber(desync.arg.repeats) or 1
+			if repeats > 1 and desync.reasm_data and desync.arg.tls_mod then
+				local saved_repeats = desync.arg.repeats
+				desync.arg.repeats = 1
+				for _ = 1, repeats do
+					local pl = tls_mod_shim(desync, fake_payload, desync.arg.tls_mod, desync.reasm_data)
+					local payload_to_send = pl or fake_payload
+					if b_debug then DLOG("fake (per-attempt): "..hexdump_dlog(payload_to_send)) end
+					rawsend_payload_segmented(desync, payload_to_send)
+				end
+				desync.arg.repeats = saved_repeats
+			else
+				if desync.reasm_data and desync.arg.tls_mod then
+					local pl = tls_mod_shim(desync, fake_payload, desync.arg.tls_mod, desync.reasm_data)
+					if pl then fake_payload = pl end
+				end
+				-- check debug to save CPU
+				if b_debug then DLOG("fake: "..hexdump_dlog(fake_payload)) end
+				rawsend_payload_segmented(desync,fake_payload)
 			end
-			-- check debug to save CPU
-			if b_debug then DLOG("fake: "..hexdump_dlog(fake_payload)) end
-			rawsend_payload_segmented(desync,fake_payload)
 		else
 			DLOG("fake: not acting on further replay pieces")
 		end
