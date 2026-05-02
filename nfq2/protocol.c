@@ -772,6 +772,15 @@ bool TLSMod_parse_list(const char *modlist, struct fake_tls_mod *tls_mod)
 			tls_mod->mod |= FAKE_TLS_MOD_Z2K_PSK;
 		else if (!strcmp(opt, "z2k_keyshare"))
 			tls_mod->mod |= FAKE_TLS_MOD_Z2K_KEYSHARE;
+		// r2 — additional rarely-present extensions для real JA3 shift.
+		else if (!strcmp(opt, "z2k_earlydata"))
+			tls_mod->mod |= FAKE_TLS_MOD_Z2K_EARLYDATA;
+		else if (!strcmp(opt, "z2k_pha"))
+			tls_mod->mod |= FAKE_TLS_MOD_Z2K_PHA;
+		else if (!strcmp(opt, "z2k_sct"))
+			tls_mod->mod |= FAKE_TLS_MOD_Z2K_SCT;
+		else if (!strcmp(opt, "z2k_delegcred"))
+			tls_mod->mod |= FAKE_TLS_MOD_Z2K_DELEGCRED;
 		else if (strcmp(opt, "none"))
 			return false;
 
