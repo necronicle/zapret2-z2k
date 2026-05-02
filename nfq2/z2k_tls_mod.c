@@ -44,12 +44,17 @@
 #include <string.h>
 #include <stdlib.h>
 
-// Bit layout for the 4 new modes. Must not collide with the existing
+// Bit layout for the new modes. Must not collide with the existing
 // upstream FAKE_TLS_MOD_* values (0x01..0x10) defined in protocol.h.
 #define FAKE_TLS_MOD_Z2K_GREASE		0x00000020
 #define FAKE_TLS_MOD_Z2K_ALPN_FLOOD	0x00000040
 #define FAKE_TLS_MOD_Z2K_PSK		0x00000080
 #define FAKE_TLS_MOD_Z2K_KEYSHARE	0x00000100
+// r2 (2026-05-03) — extensions редко уже в blob → реальный JA3 distortion
+#define FAKE_TLS_MOD_Z2K_EARLYDATA	0x00000200
+#define FAKE_TLS_MOD_Z2K_PHA		0x00000400
+#define FAKE_TLS_MOD_Z2K_SCT		0x00000800
+#define FAKE_TLS_MOD_Z2K_DELEGCRED	0x00001000
 
 // --- Byte helpers ---------------------------------------------------------
 
@@ -301,6 +306,86 @@ static bool z2k_tls_mod_keyshare(uint8_t *fake_tls, size_t *fake_tls_size,
 	return ok;
 }
 
+// r2 (2026-05-03) — non-conflicting extensions, редко в blob'ах.
+// Каждая SKIP if existing (RFC 8446 §4.2 dup-rule).
+
+// early_data (0x002a) — TLS 1.3 0-RTT marker. ClientHello-side body — empty
+// (RFC 8446 §4.2.10). Browser only emits если resumption with PSK; для
+// fresh handshake обычно отсутствует. Adding extension shifts JA3 hash.
+static bool z2k_tls_mod_earlydata(uint8_t *fake_tls, size_t *fake_tls_size,
+				  size_t fake_tls_buf_size,
+				  size_t extlen_offset)
+{
+	if (z2k_tls_has_ext(fake_tls, *fake_tls_size, extlen_offset, 0x002a)) {
+		DLOG("z2k_tls_mod: skip earlydata — already in ClientHello\n");
+		return true;
+	}
+	bool ok = z2k_tls_append_ext(fake_tls, fake_tls_size,
+				     fake_tls_buf_size, extlen_offset,
+				     0x002a, NULL, 0);
+	if (ok) DLOG("z2k_tls_mod: applied earlydata\n");
+	return ok;
+}
+
+// post_handshake_auth (0x0031) — RFC 8446 §4.2.6. Empty body. Редко emitted
+// browsers (только когда clients готовы re-auth post-handshake). Добавляет
+// рарность в fingerprint.
+static bool z2k_tls_mod_pha(uint8_t *fake_tls, size_t *fake_tls_size,
+			    size_t fake_tls_buf_size,
+			    size_t extlen_offset)
+{
+	if (z2k_tls_has_ext(fake_tls, *fake_tls_size, extlen_offset, 0x0031)) {
+		DLOG("z2k_tls_mod: skip pha — already in ClientHello\n");
+		return true;
+	}
+	bool ok = z2k_tls_append_ext(fake_tls, fake_tls_size,
+				     fake_tls_buf_size, extlen_offset,
+				     0x0031, NULL, 0);
+	if (ok) DLOG("z2k_tls_mod: applied post_handshake_auth\n");
+	return ok;
+}
+
+// signed_certificate_timestamp (0x0012) — RFC 6962. Empty body in
+// ClientHello (просто advertisement). Часто в Chrome (включает
+// Certificate Transparency monitoring), но в кastomных blob'ах может
+// отсутствовать. Skip-if-dup гарантирует валидность.
+static bool z2k_tls_mod_sct(uint8_t *fake_tls, size_t *fake_tls_size,
+			    size_t fake_tls_buf_size,
+			    size_t extlen_offset)
+{
+	if (z2k_tls_has_ext(fake_tls, *fake_tls_size, extlen_offset, 0x0012)) {
+		DLOG("z2k_tls_mod: skip sct — already in ClientHello\n");
+		return true;
+	}
+	bool ok = z2k_tls_append_ext(fake_tls, fake_tls_size,
+				     fake_tls_buf_size, extlen_offset,
+				     0x0012, NULL, 0);
+	if (ok) DLOG("z2k_tls_mod: applied signed_certificate_timestamp\n");
+	return ok;
+}
+
+// delegated_credentials (0x0022) — RFC 9345. Body: u16 list_length с
+// supported_signature_algorithms (HashAlgorithm + SignatureAlgorithm pairs).
+// Обычно отсутствует в browser ClientHello — добавляет JA3 entropy.
+// Используем минимальный body с одним algorithm (ecdsa_secp256r1_sha256).
+static bool z2k_tls_mod_delegcred(uint8_t *fake_tls, size_t *fake_tls_size,
+				  size_t fake_tls_buf_size,
+				  size_t extlen_offset)
+{
+	if (z2k_tls_has_ext(fake_tls, *fake_tls_size, extlen_offset, 0x0022)) {
+		DLOG("z2k_tls_mod: skip delegcred — already in ClientHello\n");
+		return true;
+	}
+	uint8_t body[4];
+	wr_u16(body + 0, 2);          // signature_algorithms list_length
+	wr_u16(body + 2, 0x0403);     // ecdsa_secp256r1_sha256
+	bool ok = z2k_tls_append_ext(fake_tls, fake_tls_size,
+				     fake_tls_buf_size, extlen_offset,
+				     0x0022, body, sizeof(body));
+	if (ok) DLOG("z2k_tls_mod: applied delegated_credentials\n");
+	return ok;
+}
+
 // --- Public dispatcher ----------------------------------------------------
 
 bool z2k_tls_mod_apply(uint32_t mod_bits, uint8_t *fake_tls,
@@ -314,7 +399,11 @@ bool z2k_tls_mod_apply(uint32_t mod_bits, uint8_t *fake_tls,
 	const uint32_t z2k_mask = FAKE_TLS_MOD_Z2K_GREASE
 				| FAKE_TLS_MOD_Z2K_ALPN_FLOOD
 				| FAKE_TLS_MOD_Z2K_PSK
-				| FAKE_TLS_MOD_Z2K_KEYSHARE;
+				| FAKE_TLS_MOD_Z2K_KEYSHARE
+				| FAKE_TLS_MOD_Z2K_EARLYDATA
+				| FAKE_TLS_MOD_Z2K_PHA
+				| FAKE_TLS_MOD_Z2K_SCT
+				| FAKE_TLS_MOD_Z2K_DELEGCRED;
 	if (!(mod_bits & z2k_mask)) return true;
 
 	// We only extend valid ClientHellos; the upstream TLSMod path
@@ -355,6 +444,26 @@ bool z2k_tls_mod_apply(uint32_t mod_bits, uint8_t *fake_tls,
 	if (mod_bits & FAKE_TLS_MOD_Z2K_KEYSHARE)
 		if (!z2k_tls_mod_keyshare(fake_tls, fake_tls_size,
 					  fake_tls_buf_size, extlen_offset))
+			return false;
+
+	if (mod_bits & FAKE_TLS_MOD_Z2K_EARLYDATA)
+		if (!z2k_tls_mod_earlydata(fake_tls, fake_tls_size,
+					   fake_tls_buf_size, extlen_offset))
+			return false;
+
+	if (mod_bits & FAKE_TLS_MOD_Z2K_PHA)
+		if (!z2k_tls_mod_pha(fake_tls, fake_tls_size,
+				     fake_tls_buf_size, extlen_offset))
+			return false;
+
+	if (mod_bits & FAKE_TLS_MOD_Z2K_SCT)
+		if (!z2k_tls_mod_sct(fake_tls, fake_tls_size,
+				     fake_tls_buf_size, extlen_offset))
+			return false;
+
+	if (mod_bits & FAKE_TLS_MOD_Z2K_DELEGCRED)
+		if (!z2k_tls_mod_delegcred(fake_tls, fake_tls_size,
+					   fake_tls_buf_size, extlen_offset))
 			return false;
 
 	return true;
