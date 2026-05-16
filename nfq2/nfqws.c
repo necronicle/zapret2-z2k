@@ -1934,6 +1934,70 @@ static void exithelp_clean(void)
 }
 
 #if !defined( __OpenBSD__) && !defined(__ANDROID__)
+// z2k: simple in-process tokenizer (replaces wordexp).
+//
+// wordexp() on Cygwin fork+execs /bin/sh to leverage the shell for
+// word-splitting AND expansion (variables, glob, command substitution).
+// Standalone winws2 deployments ship only winws2.exe + cygwin1.dll +
+// WinDivert — no /bin/sh — so the fork inside Cygwin's wordexp fails
+// and the call returns non-zero. Downstream z2w GUI bundle ships
+// exactly that minimal set and was hitting:
+//   winws2: failed to split command line options from file 'cache/winws2.conf'
+//
+// For @<config_file> we only need whitespace tokenization with optional
+// single/double quoting; no shell expansion. The tokenizer below
+// produces a malloc'd we_wordv/we_wordc compatible with wordfree(),
+// so cleanup_args() (params.c:wordfree) keeps working unchanged.
+//
+// Returns 0 on success, non-zero on OOM. Mutates buf in-place (does not
+// retain pointers — each token is strdup'd into its own malloc'd buffer).
+static int z2k_tokenize(char *buf, wordexp_t *we)
+{
+	size_t cap = 64, wc = 0;
+	char **wv = (char **)malloc((cap + 1) * sizeof(char *));
+	if (!wv) return -1;
+	char *p = buf;
+	while (*p)
+	{
+		while (*p == ' ') p++;
+		if (!*p) break;
+		char quote = 0;
+		if (*p == '\'' || *p == '"') { quote = *p; p++; }
+		char *start = p;
+		if (quote) {
+			while (*p && *p != quote) p++;
+		} else {
+			while (*p && *p != ' ') p++;
+		}
+		size_t len = (size_t)(p - start);
+		if (*p) p++;  /* skip closing quote or space */
+		if (wc >= cap) {
+			cap *= 2;
+			char **nwv = (char **)realloc(wv, (cap + 1) * sizeof(char *));
+			if (!nwv) {
+				for (size_t i = 0; i < wc; i++) free(wv[i]);
+				free(wv);
+				return -1;
+			}
+			wv = nwv;
+		}
+		char *tok = (char *)malloc(len + 1);
+		if (!tok) {
+			for (size_t i = 0; i < wc; i++) free(wv[i]);
+			free(wv);
+			return -1;
+		}
+		memcpy(tok, start, len);
+		tok[len] = 0;
+		wv[wc++] = tok;
+	}
+	wv[wc] = NULL;
+	we->we_wordc = wc;
+	we->we_wordv = wv;
+	we->we_offs = 0;
+	return 0;
+}
+
 // no static to not allow optimizer to inline this func (save stack)
 void config_from_file(const char *filename)
 {
@@ -1948,11 +2012,11 @@ void config_from_file(const char *filename)
 		exit_clean(1);
 	}
 	buf[bufsize + 2] = 0;
-	// wordexp fails if it sees \t \n \r between args
+	// tokenizer expects single-space separation
 	replace_char(buf, '\n', ' ');
 	replace_char(buf, '\r', ' ');
 	replace_char(buf, '\t', ' ');
-	if (wordexp(buf, &params.wexp, WRDE_NOCMD))
+	if (z2k_tokenize(buf, &params.wexp))
 	{
 		DLOG_ERR("failed to split command line options from file '%s'\n", filename);
 		exit_clean(1);
