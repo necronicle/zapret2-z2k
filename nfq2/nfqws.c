@@ -50,7 +50,7 @@
 #define NF_ACCEPT 1
 #endif
 
-#define MAX_CONFIG_FILE_SIZE 16384
+#define MAX_CONFIG_FILE_SIZE 65536
 
 struct params_s params;
 static volatile sig_atomic_t bReload = false;
