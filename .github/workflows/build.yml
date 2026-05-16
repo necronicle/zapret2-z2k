@@ -13,6 +13,12 @@ on:
     #   - 'mdig/**'
     #   - 'nfq2/**'
 
+# Opt all actions into the Node 24 runtime to avoid the 2026-06-02 forced
+# migration. Affects actions/checkout, actions/setup-python,
+# actions/{upload,download}-artifact, softprops/action-gh-release, etc.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
+
 jobs:
 
   build-linux:
@@ -427,6 +433,17 @@ jobs:
             unzip
             wget
             ${{ env.PACKAGES }}
+
+      - name: Configure cygwin git safe.directory
+        # Cygwin's git is on PATH after Set up Cygwin and gets picked up
+        # by the actions/checkout post-step at job teardown. Without this
+        # config, cygwin git fails the POSIX ownership check on
+        # /cygdrive/d/... and floods the log with "dubious ownership"
+        # warnings (artifacts already uploaded, so release is intact —
+        # but the noise hides real cleanup failures). Setting in cygwin's
+        # own ~/.gitconfig because Windows-native git has its own.
+        shell: C:\cygwin\bin\bash.exe -eo pipefail '{0}'
+        run: git config --global --add safe.directory '*'
 
       - name: Build psmisc
         if: steps.cache-restore-psmisc.outputs.cache-hit != 'true'
