@@ -496,11 +496,14 @@ jobs:
 
   release:
     if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && startsWith(github.ref, 'refs/tags/v')
-    # z2k fork only uses Linux binaries on routers. Android/FreeBSD/Windows
-    # builds stay in the matrix for parity with upstream but release cuts
-    # as soon as Linux is done — unrelated breakage (e.g. Cygwin mirror
-    # going stale on psmisc source) must not block our Linux releases.
-    needs: [ build-linux ]
+    # z2k fork ships BOTH Linux (router builds) AND Windows binaries
+    # (consumed by downstream z2w via the release ZIP). Без windows в
+    # needs: release job гонится с build-windows и ZIP мог уйти без
+    # binaries/windows-* — реально случилось на r4, поймал audit.
+    # Android/FreeBSD остаются вне needs: они для parity с upstream,
+    # downstream не используются, и их регресс не должен блокировать
+    # релиз.
+    needs: [ build-linux, build-windows ]
     permissions:
       contents: write
     runs-on: ubuntu-latest
