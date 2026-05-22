@@ -1427,6 +1427,114 @@ static bool dp_rediscovery(struct play_state *ps)
 }
 
 
+// z2k: --z2k-syn-dup-md5=N — send N duplicate copies of an outgoing TCP SYN
+// with a TCP MD5 option (kind=19, len=18, 16 random bytes) appended.
+//
+// Mimics upstream zapret v71's `--dup=N --dup-fooling=md5sig --dup-cutoff=n2`
+// recipe for plain-HTTP DPI body-cap bypass. TSPU's per-connection
+// 25-packet body cap was found to skip flows where SYN carries an MD5
+// option (presumably misclassified as BGP-like infra traffic). Our gen2
+// nfqws2 lacks the full --dup-* set from gen1 — this is the targeted
+// minimum: one global flag, applied to all outgoing SYNs across all
+// profiles, dedup'd per-connection so SYN-retransmissions don't trigger
+// more dups.
+//
+// Returns true on success. On any error (malformed packet, csum helpers
+// missing, rawsend fail), returns false — caller still passes original
+// SYN through; only the bypass is missed.
+static bool z2k_send_syn_md5_dups(const struct dissect *dis, uint32_t fwmark, const char *ifout)
+{
+	if (!dis->tcp || !dis->data_pkt || dis->len_pkt == 0)
+		return false;
+
+	// 18 bytes of MD5 option + up to 3 NOPs for 4-byte alignment
+	// Max TCP header = 60 bytes; we need to fit the new options.
+	uint8_t pkt[1600];
+	if (dis->len_pkt + 24 > sizeof(pkt))
+		return false;
+
+	memcpy(pkt, dis->data_pkt, dis->len_pkt);
+
+	// Locate TCP header inside the copy. dis->tcp points into data_pkt
+	// (the original); compute offset and translate to pkt.
+	size_t tcp_off = (const uint8_t *)dis->tcp - dis->data_pkt;
+	if (tcp_off >= dis->len_pkt)
+		return false;
+	struct tcphdr *tcp_new = (struct tcphdr *)(pkt + tcp_off);
+
+	// Old TCP header length (in bytes), and where options end.
+	size_t tcp_hdrlen_old = tcp_new->th_off * 4;
+	if (tcp_hdrlen_old < 20 || tcp_hdrlen_old > 60)
+		return false;
+	if (tcp_off + tcp_hdrlen_old > dis->len_pkt)
+		return false;
+
+	// Append 18 bytes of MD5 option + up to 3 NOPs for 4-byte alignment.
+	// New TCP header length must still be ≤ 60 (15 * 4).
+	size_t md5_len = 18; // kind=1 + len=1 + 16 bytes data
+	size_t pad = (4 - (md5_len & 3)) & 3; // NOPs to align to 4 bytes
+	size_t total_add = md5_len + pad;
+	if (tcp_hdrlen_old + total_add > 60)
+		return false;
+
+	// Need to shift any payload (rare on SYN — usually zero) up by total_add.
+	size_t payload_off = tcp_off + tcp_hdrlen_old;
+	size_t payload_len = dis->len_pkt - payload_off;
+	if (payload_len > 0)
+		memmove(pkt + payload_off + total_add, pkt + payload_off, payload_len);
+
+	// Write MD5 option at end of existing options.
+	uint8_t *opt = pkt + payload_off;
+	opt[0] = TCP_KIND_MD5;
+	opt[1] = 18;
+	for (size_t i = 2; i < 18; i++)
+		opt[i] = (uint8_t)(rand() & 0xFF);
+	// NOPs for alignment
+	for (size_t i = 0; i < pad; i++)
+		opt[18 + i] = TCP_KIND_NOOP;
+
+	// Update TCP doff
+	tcp_new->th_off = (tcp_hdrlen_old + total_add) / 4;
+
+	// New total packet length
+	size_t new_len = dis->len_pkt + total_add;
+
+	// Update IPv4 total length / IPv6 payload length and recompute checksums.
+	if (dis->ip)
+	{
+		struct ip *ip_new = (struct ip *)pkt;
+		ip_new->ip_len = htons(new_len);
+		ip_new->ip_sum = 0;
+		ip4_fix_checksum(ip_new);
+
+		size_t transport_len = new_len - (ip_new->ip_hl << 2);
+		tcp_fix_checksum(tcp_new, transport_len, ip_new, NULL);
+	}
+	else if (dis->ip6)
+	{
+		struct ip6_hdr *ip6_new = (struct ip6_hdr *)pkt;
+		ip6_new->ip6_ctlun.ip6_un1.ip6_un1_plen = htons(new_len - sizeof(struct ip6_hdr));
+		size_t transport_len = new_len - sizeof(struct ip6_hdr);
+		tcp_fix_checksum(tcp_new, transport_len, NULL, ip6_new);
+	}
+	else
+	{
+		return false;
+	}
+
+	// Extract destination for rawsend.
+	struct sockaddr_storage src, dst;
+	extract_endpoints(dis->ip, dis->ip6, dis->tcp, NULL, &src, &dst);
+
+	DLOG("z2k_syn_dup_md5: sending %u MD5-SYN dup(s) (orig_len=%zu, new_len=%zu)\n",
+		params.z2k_syn_dup_md5, dis->len_pkt, new_len);
+
+	return rawsend_rep((int)params.z2k_syn_dup_md5,
+		(struct sockaddr *)&dst, fwmark | params.desync_fwmark, ifout,
+		pkt, new_len);
+}
+
+
 static uint8_t dpi_desync_tcp_packet_play(
 	unsigned int replay_piece, unsigned int replay_piece_count, size_t reasm_offset,
 	uint32_t fwmark,
@@ -2191,6 +2299,19 @@ static uint8_t dpi_desync_packet_play(
 					rst_filter_note_incoming(&dis);
 				}
 			}
+		}
+
+		// z2k: --z2k-syn-dup-md5 — fire on first pure outgoing SYN of a
+		// connection, BEFORE profile dispatch. Independent of hostlist /
+		// L7 classification (TSPU body cap is per-conn, not per-host, so
+		// every flow benefits). Real packet still passes through normally
+		// — we just emit N MD5-tagged copies alongside.
+		// Trigger: real packet (not replay), TCP, pure SYN, outgoing.
+		if (params.z2k_syn_dup_md5 && dis.tcp && !replay_piece_count &&
+			ifout && *ifout && (!ifin || !*ifin) &&
+			(dis.tcp->th_flags & (TH_SYN | TH_ACK | TH_FIN | TH_RST)) == TH_SYN)
+		{
+			z2k_send_syn_md5_dups(&dis, fwmark, ifout);
 		}
 
 		// fix csum if unmodified and if OS can pass wrong csum to queue (depends on OS)
