@@ -192,6 +192,16 @@ struct params_s
 	// Implemented in z2k_ipblock.c.
 	enum z2k_ipblock_mode z2k_ipblock_detect;
 
+	// z2k: send N duplicate TCP SYNs with MD5 option on each outgoing
+	// connection-initiation. 0 = off. Mimics upstream zapret v71's
+	// "--dup=N --dup-fooling=md5sig --dup-cutoff=n2" recipe — TSPU sees
+	// the MD5-tagged SYNs and treats the flow as BGP-like infrastructure
+	// traffic, skipping the per-connection 25-packet body cap that
+	// otherwise truncates HTTP responses past ~30KB on plain-HTTP CDNs
+	// (e.g. cdnbase.com fronting fast-torrent.ru).
+	// Implemented in desync.c — see z2k_send_syn_md5_dups().
+	unsigned int z2k_syn_dup_md5;
+
 #ifdef HAS_FILTER_SSID
 	bool filter_ssid_present;
 #endif

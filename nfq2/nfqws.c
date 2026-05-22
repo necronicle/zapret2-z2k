@@ -1996,6 +1996,7 @@ enum opt_indices {
 	IDX_CTRACK_DISABLE,
 	IDX_RST_FILTER,
 	IDX_IPBLOCK_DETECT,
+	IDX_Z2K_SYN_DUP_MD5,
 	IDX_PAYLOAD_DISABLE,
 	IDX_SERVER,
 	IDX_IPCACHE_LIFETIME,
@@ -2103,6 +2104,7 @@ static const struct option long_options[] = {
 	[IDX_CTRACK_DISABLE] = {"ctrack-disable", optional_argument, 0, 0},
 	[IDX_RST_FILTER] = {"rst-filter", required_argument, 0, 0},
 	[IDX_IPBLOCK_DETECT] = {"ipblock-detect", required_argument, 0, 0},
+	[IDX_Z2K_SYN_DUP_MD5] = {"z2k-syn-dup-md5", required_argument, 0, 0},
 	[IDX_PAYLOAD_DISABLE] = {"payload-disable", optional_argument, 0, 0},
 	[IDX_SERVER] = {"server", optional_argument, 0, 0},
 	[IDX_IPCACHE_LIFETIME] = {"ipcache-lifetime", required_argument, 0, 0},
@@ -2494,6 +2496,13 @@ int main(int argc, char **argv)
 			else
 			{
 				DLOG_ERR("invalid ipblock-detect value. expected: off|on\n");
+				exit_clean(1);
+			}
+			break;
+		case IDX_Z2K_SYN_DUP_MD5:
+			if (sscanf(optarg, "%u", &params.z2k_syn_dup_md5) != 1 || params.z2k_syn_dup_md5 > 64)
+			{
+				DLOG_ERR("invalid z2k-syn-dup-md5 value. expected: 0..64\n");
 				exit_clean(1);
 			}
 			break;
