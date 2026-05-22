@@ -84,7 +84,11 @@ typedef struct
 
 	t_l7payload reasm_client_payload;	// payload type being reassembled
 	t_reassemble reasm_client;
-	struct rawpacket_queue delayed;
+	struct rawpacket_queue delayed;	// v1.0.3: renamed type from rawpacket_tailhead
+
+	// z2k: set true after we've sent the MD5-SYN dups for this connection,
+	// so we don't dup them again on SYN retransmissions
+	bool z2k_synmd5_sent;
 } t_ctrack;
 
 typedef struct
