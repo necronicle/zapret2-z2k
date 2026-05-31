@@ -6,6 +6,7 @@
 -- standard host key generator for per-host storage
 -- arg: reqhost - require hostname, do not work with ip
 -- arg: nld=N - cut hostname to N level domain. NLD=2 static.intranet.microsoft.com => microsoft.com
+-- arg: family_split - z2k: isolate rotation state per IP address family. default ON, =0 disables.
 function standard_hostkey(desync)
 	local hostkey = desync.track and desync.track.hostname
 	if hostkey then
@@ -19,6 +20,22 @@ function standard_hostkey(desync)
 		end
 	elseif not desync.arg.reqhost then
 		hostkey = host_ip(desync)
+	end
+	-- z2k per-family rotation isolation (arg: family_split, default ON, =0 to
+	-- disable). Append the IP address family to the host key so a path that
+	-- fails on one family (e.g. IPv6 ClientHello retransmits to Meta — the host
+	-- works over IPv4 via happy-eyeballs) rotates ONLY that family's strategy
+	-- and cannot churn the strategy the working family relies on. Placed here in
+	-- standard_hostkey (NOT in automate_host_record) so z2k-state-persist's
+	-- get_hostkey_func, which calls this function directly to compute the persist
+	-- key, derives the SAME suffixed key — keeping state.tsv consistent with the
+	-- rotator's autostate[askey][hostkey].
+	if hostkey and desync.arg.family_split ~= "0" and desync.dis then
+		if desync.dis.ip6 then
+			hostkey = hostkey .. "|6"
+		elseif desync.dis.ip then
+			hostkey = hostkey .. "|4"
+		end
 	end
 	return hostkey
 end
