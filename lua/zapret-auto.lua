@@ -102,11 +102,26 @@ function automate_failure_counter(hrec, crec, fails, maxtime)
 			DLOG("automate: failure counter reset because last failure was "..(tnow - hrec.failure_time_last).." seconds ago")
 			hrec.failure_counter = 0
 		end
+		-- z2k: age out a stale success offset. The early per-connection
+		-- proof-of-life credit (automate_success_counter) must NOT mask a
+		-- fresh failure once the server has stopped responding for >maxtime.
+		-- Pruned on the LAST SUCCESS time, independent of the failure stream,
+		-- so a working->blocked host loses its offset within one maxtime window.
+		if hrec.success_counter and hrec.success_time_last
+		   and tnow>(hrec.success_time_last + maxtime) then
+			DLOG("automate: success offset reset because last success was "..(tnow - hrec.success_time_last).." seconds ago")
+			hrec.success_counter = nil
+			hrec.success_time_last = nil
+		end
 		hrec.failure_counter = hrec.failure_counter + 1
 		hrec.failure_time_last = tnow
-		if b_debug then DLOG("automate: failure counter "..hrec.failure_counter..(fails and ('/'..fails) or '')) end
-		if fails and hrec.failure_counter>=fails then
+		local succ = hrec.success_counter or 0
+		local net = hrec.failure_counter - succ
+		if b_debug then DLOG("automate: failure counter "..hrec.failure_counter.."-"..succ.."(succ)=net "..net..(fails and ('/'..fails) or '')) end
+		if fails and net>=fails then
 			hrec.failure_counter = nil -- reset counter
+			hrec.success_counter = nil -- reset offset together
+			hrec.success_time_last = nil
 			return true
 		end
 	end
@@ -114,10 +129,37 @@ function automate_failure_counter(hrec, crec, fails, maxtime)
 end
 -- resets failure counter if it has started counting
 function automate_failure_counter_reset(hrec)
-	if hrec.failure_counter then
-		DLOG("automate: failure counter reset")
+	if hrec.failure_counter or hrec.success_counter then
+		DLOG("automate: failure/success counter reset")
+		hrec.failure_counter = nil
+		hrec.success_counter = nil
+		hrec.success_time_last = nil
+	end
+end
+
+-- z2k: credit an EARLY per-connection proof-of-life into the same rolling
+-- window the failure counter uses. Deduped per-connection via
+-- crec.success_credited (one connection offsets at most ONE failure, mirroring
+-- crec.failure). success_counter is CLAMPED to (fails-1) so a working burst can
+-- lower the effective blocked-rotation threshold by at most fails-1 connections
+-- -> a genuinely-blocked host ALWAYS still rotates. Touches only host-side
+-- fields; never mutates crec.nocheck / crec.failure, so z2k-state-persist
+-- accounting is unaffected.
+function automate_success_counter(hrec, crec, fails, maxtime)
+	if crec and crec.success_credited then return end
+	if crec then crec.success_credited = true end
+	local tnow=os.time()
+	-- age out a stale failure run before we offset it
+	if hrec.failure_counter and hrec.failure_time_last
+	   and tnow>(hrec.failure_time_last + maxtime) then
 		hrec.failure_counter = nil
 	end
+	local cap = (fails and fails>1) and (fails-1) or 1
+	local succ = (hrec.success_counter or 0) + 1
+	if succ>cap then succ = cap end
+	hrec.success_counter = succ
+	hrec.success_time_last = tnow
+	if b_debug then DLOG("automate: success offset "..hrec.success_counter.."(cap "..cap..")") end
 end
 
 -- location is url compatible with Location: header
@@ -270,6 +312,32 @@ function standard_success_detector(desync, crec)
 	return false
 end
 
+-- z2k: EARLY proof-of-life on an INCOMING packet — the server is responding
+-- within ~1 RTT, far before the slow inseq=26000 strong-success. Two signals:
+--  POL-1: a structurally VALIDATED incoming TLS ServerHello (same byte-check
+--         z2k_tls_stalled trusts) — injected TLS-shaped junk cannot forge it.
+--  POL-2: first real reverse data crossed a small floor (512B) a blocked path
+--         never reaches but well below inseq=26000 — covers non-TLS / coalesced
+--         flights. reverse counters are per-conntrack so a blocked flow reads 0.
+function automate_proof_of_life(desync)
+	if desync.outgoing or not desync.dis or not desync.dis.tcp then return false end
+	if desync.l7payload == "tls_server_hello" then
+		local p = desync.dis.payload
+		if type(p) == "string" and #p >= 60
+		   and p:byte(1) == 0x16 and p:byte(2) == 0x03
+		   and p:byte(3) >= 0x01 and p:byte(3) <= 0x04
+		   and p:byte(6) == 0x02 then
+			local rec_len = p:byte(4)*256 + p:byte(5)
+			local hs_len  = p:byte(8)*256 + p:byte(9)
+			if hs_len > 0 and hs_len + 4 <= rec_len then return true end
+		end
+	end
+	if pos_get(desync,'d',true) >= 1 and pos_get(desync,'b',true) > 512 then
+		return true
+	end
+	return false
+end
+
 -- calls success and failure detectors
 -- resets counter if success is detected
 -- increases counter if failure is detected
@@ -295,6 +363,18 @@ function automate_failure_check(desync, hrec, crec)
 		success_detector = standard_success_detector
 	end
 
+	local fails = tonumber(desync.arg.fails) or 3
+	local maxtime = tonumber(desync.arg.time) or 60
+
+	-- z2k: EARLY per-connection proof-of-life. Credit BEFORE detectors so a
+	-- ServerHello arriving on THIS connection offsets its own handshake-time
+	-- retransmit failure within the same window. Does NOT latch crec.nocheck
+	-- (the strong 26KB success below remains the terminal latch) and does NOT
+	-- mutate crec.failure (state-persist accounting untouched).
+	if automate_proof_of_life(desync) then
+		automate_success_counter(hrec, crec, fails, maxtime)
+	end
+
 	if success_detector(desync, crec) then
 		crec.nocheck = true
 		DLOG("automate: success detected")
@@ -302,10 +382,13 @@ function automate_failure_check(desync, hrec, crec)
 		return false
 	end
 	if failure_detector(desync, crec) then
-		crec.nocheck = true
+		-- z2k: do NOT latch crec.nocheck here. Leaving the connection evaluable
+		-- lets its own later ServerHello / 26KB success still credit/reset.
+		-- crec.failure (set inside automate_failure_counter) provides the same
+		-- one-failure-per-connection dedup the latch used to provide, and the
+		-- retrans guard ((crec.retrans or 0)<arg.retrans) prevents any re-RST /
+		-- re-count once crec.retrans reaches arg.retrans.
 		DLOG("automate: failure detected")
-		local fails = tonumber(desync.arg.fails) or 3
-		local maxtime = tonumber(desync.arg.time) or 60
 		return automate_failure_counter(hrec, crec, fails, maxtime)
 	end
 
