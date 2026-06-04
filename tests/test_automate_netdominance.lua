@@ -41,14 +41,15 @@ do local h={}
   ck("T1 blocked: C.fail ROTATES",   true,  pkt(mk_fail,h,{}))
 end
 
--- T2 v6 transient: each conn fail then ServerHello -> never rotate
+-- T2 success-dominant host (working high-parallelism HTTP/2): many SH
+-- successes out-vote a minority of retransmit failures -> never rotate.
+-- (option B: success uncapped; old fails-1 clamp made this rotate falsely.)
 do local h={}
-  local a,b,c={},{},{}
-  pkt(mk_fail,h,a); pkt(mk_sh,h,a)
-  pkt(mk_fail,h,b); pkt(mk_sh,h,b)
-  ck("T2 v6: C.fail after 2 SH credits no rotate", false, pkt(mk_fail,h,c))
-  pkt(mk_sh,h,c)
-  ck("T2 v6: success_counter capped at fails-1=2", 2, h.success_counter)
+  local s1,s2,s3,s4={},{},{},{}
+  pkt(mk_sh,h,s1); pkt(mk_sh,h,s2); pkt(mk_sh,h,s3); pkt(mk_sh,h,s4)  -- succ=4
+  pkt(mk_fail,h,{}); pkt(mk_fail,h,{})                                -- fc=2
+  ck("T2 success-dominant: 4 succ + 3 fail no rotate", false, pkt(mk_fail,h,{}))  -- fc=3<=succ=4
+  ck("T2 success offset uncapped (==4, old cap was 2)", 4, h.success_counter)
 end
 
 -- T3 worst interleave: all fail before any SH -> rotate once then settle
@@ -58,13 +59,13 @@ do local h={}
   ck("T3 worst: counters reset after rotate", nil, h.failure_counter)
 end
 
--- T4 partial degrade: 1 working (fail+SH) + 4 blocked -> rotate
+-- T4 partial degrade: 1 working (fail+SH) but blocked connections dominate
+-- -> rotate once failures out-number the single live success.
 do local h={}
   local w={}
   pkt(mk_fail,h,w); pkt(mk_sh,h,w)   -- working: counter=1, succ=1
-  pkt(mk_fail,h,{})                  -- B1 counter=2 net=1
-  pkt(mk_fail,h,{})                  -- B2 counter=3 net=2
-  ck("T4 partial: majority-blocked ROTATES", true, pkt(mk_fail,h,{}))  -- B3 counter=4 net=3
+  pkt(mk_fail,h,{})                  -- B1 counter=2, succ=1, 2<fails -> no
+  ck("T4 majority-blocked ROTATES", true, pkt(mk_fail,h,{}))  -- B2 counter=3>succ=1 -> rotate
 end
 
 -- T5 working->blocked: success offset ages out after maxtime

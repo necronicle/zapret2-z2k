@@ -118,7 +118,17 @@ function automate_failure_counter(hrec, crec, fails, maxtime)
 		local succ = hrec.success_counter or 0
 		local net = hrec.failure_counter - succ
 		if b_debug then DLOG("automate: failure counter "..hrec.failure_counter.."-"..succ.."(succ)=net "..net..(fails and ('/'..fails) or '')) end
-		if fails and net>=fails then
+		-- z2k option B (dominance): rotate only when failures reach the absolute
+		-- floor (fails) AND strictly out-number the live proof-of-life successes.
+		-- A tie (failure_counter==succ) does NOT rotate -- benefit of the doubt
+		-- to a host that is demonstrably half-alive. This replaces the old
+		-- net=(fail-succ)>=fails rule which, paired with the (now-removed) fails-1
+		-- success clamp, false-rotated working parallel-HTTP/2 hosts (Instagram /
+		-- YouTube) on ordinary retransmit noise. A genuinely-blocked host has no
+		-- proof-of-life (succ=0) so failure_counter>succ holds and it rotates at
+		-- `fails` exactly as before; a working host that goes dark loses its
+		-- offset via the stale-success aging above within one maxtime window.
+		if fails and hrec.failure_counter>=fails and hrec.failure_counter>succ then
 			hrec.failure_counter = nil -- reset counter
 			hrec.success_counter = nil -- reset offset together
 			hrec.success_time_last = nil
@@ -139,12 +149,23 @@ end
 
 -- z2k: credit an EARLY per-connection proof-of-life into the same rolling
 -- window the failure counter uses. Deduped per-connection via
--- crec.success_credited (one connection offsets at most ONE failure, mirroring
--- crec.failure). success_counter is CLAMPED to (fails-1) so a working burst can
--- lower the effective blocked-rotation threshold by at most fails-1 connections
--- -> a genuinely-blocked host ALWAYS still rotates. Touches only host-side
--- fields; never mutates crec.nocheck / crec.failure, so z2k-state-persist
--- accounting is unaffected.
+-- crec.success_credited (one connection credits at most ONE success, mirroring
+-- crec.failure). Touches only host-side fields; never mutates crec.nocheck /
+-- crec.failure, so z2k-state-persist accounting is unaffected.
+--
+-- z2k option B (dominance): success_counter is UNCAPPED. Every connection that
+-- shows proof-of-life adds one success to the rolling window, so the tally
+-- tracks the real number of live connections. On a working high-parallelism
+-- host (Instagram / YouTube HTTP/2: dozens of sockets, each with a ServerHello
+-- and/or >512B reverse flight) a minority of retransmitting sockets can no
+-- longer out-vote the many that work. The previous (fails-1) clamp neutered
+-- proof-of-life on exactly those sites (succ pinned at 2 while per-connection
+-- retransmit failures piled up uncapped -> net>=fails -> false rotation of a
+-- working strategy). A genuine block still rotates: no proof-of-life keeps succ
+-- at 0, and the stale-success aging in automate_failure_counter prunes the
+-- offset within one maxtime window when a working host goes dark, restoring
+-- failure dominance (see the dominance trigger there). The `fails` arg is no
+-- longer used here (kept for call-site signature compatibility).
 function automate_success_counter(hrec, crec, fails, maxtime)
 	if crec and crec.success_credited then return end
 	if crec then crec.success_credited = true end
@@ -154,12 +175,9 @@ function automate_success_counter(hrec, crec, fails, maxtime)
 	   and tnow>(hrec.failure_time_last + maxtime) then
 		hrec.failure_counter = nil
 	end
-	local cap = (fails and fails>1) and (fails-1) or 1
-	local succ = (hrec.success_counter or 0) + 1
-	if succ>cap then succ = cap end
-	hrec.success_counter = succ
+	hrec.success_counter = (hrec.success_counter or 0) + 1
 	hrec.success_time_last = tnow
-	if b_debug then DLOG("automate: success offset "..hrec.success_counter.."(cap "..cap..")") end
+	if b_debug then DLOG("automate: success offset "..hrec.success_counter) end
 end
 
 -- location is url compatible with Location: header
