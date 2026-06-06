@@ -15,6 +15,12 @@ end
 function mock_fail(d, crec) return d._fail == true end
 function mock_succ(d, crec) return d._strong == true end
 
+-- This suite exercises the r-49 proof-of-life + net-dominance path, which is the
+-- Z2K_NATIVE_ROTATION=0 FALLBACK (the default is pure bol-van rotation with POL
+-- OFF). Force the fallback so the POL-crediting assertions below run. Must be set
+-- BEFORE dofile — the engine reads the flag once at load time.
+os.getenv = function(k) if k == "Z2K_NATIVE_ROTATION" then return "0" end return nil end
+
 dofile("lua/zapret-auto.lua")
 
 local P,F = 0,0
@@ -31,6 +37,11 @@ local function mk_sh()
   return { outgoing=false, l7payload="tls_server_hello", dis={tcp={}, payload=p}, arg=ARG }
 end
 local function mk_pol2()   return { outgoing=false, dis={tcp={}}, arg=ARG, _rev={d=2,b=900} } end
+-- a working content flow: reverse pbcounter past the content gate (16384).
+-- Sets hrec.content_seen_last via automate_content_gate, exactly like a real
+-- flow that streams real app data does. This is what distinguishes a WORKING
+-- host from a handshake-but-blocked one (whose flows never cross the gate).
+local function mk_content() return { outgoing=false, dis={tcp={}}, arg=ARG, _rev={d=20,b=20000} } end
 -- fire one packet on (hrec, crec); returns true if it caused a ROTATE
 local function pkt(mkfn, hrec, crec) return automate_failure_check(mkfn(), hrec, crec) == true end
 
@@ -44,12 +55,27 @@ end
 -- T2 success-dominant host (working high-parallelism HTTP/2): many SH
 -- successes out-vote a minority of retransmit failures -> never rotate.
 -- (option B: success uncapped; old fails-1 clamp made this rotate falsely.)
+-- A WORKING host also delivers real content on >=1 flow (mk_content), which
+-- sets the content gate so the content-gated bypass does NOT apply and the
+-- unchanged dominance test governs.
 do local h={}
   local s1,s2,s3,s4={},{},{},{}
   pkt(mk_sh,h,s1); pkt(mk_sh,h,s2); pkt(mk_sh,h,s3); pkt(mk_sh,h,s4)  -- succ=4
+  pkt(mk_content,h,s1)                                                -- content gate fresh
   pkt(mk_fail,h,{}); pkt(mk_fail,h,{})                                -- fc=2
   ck("T2 success-dominant: 4 succ + 3 fail no rotate", false, pkt(mk_fail,h,{}))  -- fc=3<=succ=4
   ck("T2 success offset uncapped (==4, old cap was 2)", 4, h.success_counter)
+  ck("T2 content gate set by working flow", true, h.content_seen_last ~= nil)
+end
+
+-- T2b whatsapp handshake-but-block (R1, end-to-end through automate_failure_check):
+-- bare ServerHellos pump succ but NO flow crosses the content gate -> the
+-- content-gated bypass rotates at fails despite succ being high (the deadlock
+-- r-49-alone never broke).
+do local h={}
+  pkt(mk_sh,h,{}); pkt(mk_sh,h,{}); pkt(mk_sh,h,{}); pkt(mk_sh,h,{})  -- succ=4, NO content
+  pkt(mk_fail,h,{}); pkt(mk_fail,h,{})                                -- fc=2
+  ck("T2b whatsapp: 4 SH(succ) + no content + 3rd fail ROTATES", true, pkt(mk_fail,h,{}))
 end
 
 -- T3 worst interleave: all fail before any SH -> rotate once then settle
