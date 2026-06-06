@@ -113,25 +113,43 @@ function automate_failure_counter(hrec, crec, fails, maxtime)
 			hrec.success_counter = nil
 			hrec.success_time_last = nil
 		end
+		-- z2k: age out a stale content gate on its OWN (longer) window so a host
+		-- that genuinely stops delivering content for the FULL gate window loses
+		-- protection and becomes rotatable, while a merely content-quiet working
+		-- host (idle < gate window) keeps it.
+		local gate_window = Z2K_CONTENT_GATE_WINDOW or 300
+		if hrec.content_seen_last and tnow>(hrec.content_seen_last + gate_window) then
+			DLOG("automate: content gate aged out (last content "..(tnow - hrec.content_seen_last).."s ago)")
+			hrec.content_seen_last = nil
+		end
 		hrec.failure_counter = hrec.failure_counter + 1
 		hrec.failure_time_last = tnow
 		local succ = hrec.success_counter or 0
 		local net = hrec.failure_counter - succ
-		if b_debug then DLOG("automate: failure counter "..hrec.failure_counter.."-"..succ.."(succ)=net "..net..(fails and ('/'..fails) or '')) end
-		-- z2k option B (dominance): rotate only when failures reach the absolute
-		-- floor (fails) AND strictly out-number the live proof-of-life successes.
-		-- A tie (failure_counter==succ) does NOT rotate -- benefit of the doubt
-		-- to a host that is demonstrably half-alive. This replaces the old
-		-- net=(fail-succ)>=fails rule which, paired with the (now-removed) fails-1
-		-- success clamp, false-rotated working parallel-HTTP/2 hosts (Instagram /
-		-- YouTube) on ordinary retransmit noise. A genuinely-blocked host has no
-		-- proof-of-life (succ=0) so failure_counter>succ holds and it rotates at
-		-- `fails` exactly as before; a working host that goes dark loses its
-		-- offset via the stale-success aging above within one maxtime window.
-		if fails and hrec.failure_counter>=fails and hrec.failure_counter>succ then
+		local content_fresh = hrec.content_seen_last and tnow<=(hrec.content_seen_last + gate_window) or false
+		if b_debug then DLOG("automate: failure counter "..hrec.failure_counter.."-"..succ.."(succ)=net "..net..(fails and ('/'..fails) or '').." content_fresh="..tostring(content_fresh)) end
+		-- z2k option B (dominance) + content gate. Rotate when failures reach the
+		-- absolute floor (fails) AND EITHER:
+		--   (a) failures strictly out-number live proof-of-life successes
+		--       (the r-49 dominance test, UNCHANGED — governs every host that has
+		--        delivered real content within the gate window), OR
+		--   (b) the host has delivered NO real reverse content on ANY flow within
+		--       the gate window (content_fresh==false). This is the handshake-but-
+		--       BLOCKED class (whatsapp/Meta): ~150 ServerHellos pump success_counter
+		--       but no flow ever crosses Z2K_CONTENT_GATE_BYTES, so the weak
+		--       ServerHello flood can no longer protect a strategy that delivers
+		--       zero content. The deadlock (succ>=failure forever) is broken.
+		-- A tie (failure_counter==succ) on a content-delivering host does NOT
+		-- rotate -- benefit of the doubt to a half-alive host. R2/R3 (working
+		-- parallel HTTP/2 with retransmit/idle-keepalive noise) keep content_fresh
+		-- true via >=1 real content flow, so path (a) governs and succ out-votes
+		-- the noise exactly as r-49 designed.
+		if fails and hrec.failure_counter>=fails
+		   and (hrec.failure_counter>succ or not content_fresh) then
 			hrec.failure_counter = nil -- reset counter
 			hrec.success_counter = nil -- reset offset together
 			hrec.success_time_last = nil
+			hrec.content_seen_last = nil -- fresh strategy starts with a clean gate
 			return true
 		end
 	end
@@ -330,6 +348,37 @@ function standard_success_detector(desync, crec)
 	return false
 end
 
+-- z2k: per-host "real content delivered" gate. The STRONG discriminator that
+-- separates a handshake-but-BLOCKED host (whatsapp/Meta: every flow stalls at
+-- the ~3-5KB cert flight) from a WORKING host (YouTube/Instagram: >=1 flow
+-- streams real app data well past the handshake). ServerHello completion and
+-- the >512B POL-2 floor are present on BOTH and are therefore WEAK proofs;
+-- "reverse content crossed Z2K_CONTENT_GATE_BYTES on at least one flow" happens
+-- ONLY on a host that actually delivers content.
+--
+-- Reads pos_get(desync,'b',true) = per-conntrack cumulative reverse (incoming)
+-- bytes (track.pos.reverse.pbcounter) — the SAME signal POL-2 already trusts, so
+-- the fix introduces NO new engine signal. Threshold 16384 mirrors silent_drop's
+-- bytes_in_handshake_done ("past handshake + first real HTTP/2 app frames");
+-- whatsapp's 3-5KB flight never reaches it. Env-tunable for field calibration.
+--
+-- The gate timestamp ages on its OWN window (Z2K_CONTENT_GATE_WINDOW, default
+-- 300s — DECOUPLED from maxtime=60s ON PURPOSE) so a WORKING host that is merely
+-- content-quiet for a maxtime window (user reading a page, cached assets) does
+-- NOT lose its protection and get false-rotated on a navigation stall. A host
+-- that delivers ZERO content for the FULL gate window across ALL flows is the
+-- genuine handshake-but-block class and becomes rotatable.
+Z2K_CONTENT_GATE_BYTES  = tonumber(os.getenv("Z2K_CONTENT_GATE_BYTES"))  or 16384
+Z2K_CONTENT_GATE_WINDOW = tonumber(os.getenv("Z2K_CONTENT_GATE_WINDOW")) or 300
+function automate_content_gate(desync, hrec)
+	if desync.outgoing or not desync.dis or not desync.dis.tcp then return end
+	local b = pos_get(desync,'b',true)
+	if b and b > Z2K_CONTENT_GATE_BYTES then
+		hrec.content_seen_last = os.time()
+		if b_debug then DLOG("automate: content gate set (reverse "..b.."B > "..Z2K_CONTENT_GATE_BYTES..")") end
+	end
+end
+
 -- z2k: EARLY proof-of-life on an INCOMING packet — the server is responding
 -- within ~1 RTT, far before the slow inseq=26000 strong-success. Two signals:
 --  POL-1: a structurally VALIDATED incoming TLS ServerHello (same byte-check
@@ -337,6 +386,11 @@ end
 --  POL-2: first real reverse data crossed a small floor (512B) a blocked path
 --         never reaches but well below inseq=26000 — covers non-TLS / coalesced
 --         flights. reverse counters are per-conntrack so a blocked flow reads 0.
+-- NOTE: both POL signals stay WEAK (they fire on a handshake-but-blocked host
+-- too). They credit success_counter (the dominance vote) and refresh
+-- success_time_last EXACTLY as r-49 designed — that refresh is what keeps a
+-- WORKING host's offset alive and is NOT touched here. The content gate above
+-- is the SEPARATE strong signal that decides the new rotation path.
 function automate_proof_of_life(desync)
 	if desync.outgoing or not desync.dis or not desync.dis.tcp then return false end
 	if desync.l7payload == "tls_server_hello" then
@@ -355,6 +409,17 @@ function automate_proof_of_life(desync)
 	end
 	return false
 end
+
+-- z2k: NATIVE rotation mode (DEFAULT ON). With pure bol-van standard detectors
+-- there are no heuristic false-failures to offset, so the r-49 proof-of-life
+-- success-offset + content-gate are not only unnecessary — they actively DROWN
+-- real RST failures on a handshake-but-blocked host (flibusta-48: 7 real RST
+-- fails vs 55 ServerHello "successes" -> net -48 -> never rotates). Native mode
+-- DISABLES POL + content-gate so circular rotates on the plain failure count
+-- exactly like upstream bol-van. Set Z2K_NATIVE_ROTATION=0 to restore the r-49
+-- dominance/POL behaviour (only sensible alongside the custom silent_drop
+-- detectors). family-split (standard_hostkey |4/|6) stays ON regardless.
+local Z2K_NATIVE_ROTATION = (os.getenv("Z2K_NATIVE_ROTATION") ~= "0")
 
 -- calls success and failure detectors
 -- resets counter if success is detected
@@ -389,8 +454,16 @@ function automate_failure_check(desync, hrec, crec)
 	-- retransmit failure within the same window. Does NOT latch crec.nocheck
 	-- (the strong 26KB success below remains the terminal latch) and does NOT
 	-- mutate crec.failure (state-persist accounting untouched).
-	if automate_proof_of_life(desync) then
-		automate_success_counter(hrec, crec, fails, maxtime)
+	if not Z2K_NATIVE_ROTATION then
+		-- r-49 counter-measure — custom-detector mode ONLY. Credit early
+		-- per-connection proof-of-life (offsets a custom detector's false
+		-- handshake-time failure) and track the content gate that the dominance
+		-- path in automate_failure_counter consumes. Both are inert/harmful in
+		-- native mode (real RST failures must NOT be offset), so they are skipped.
+		if automate_proof_of_life(desync) then
+			automate_success_counter(hrec, crec, fails, maxtime)
+		end
+		automate_content_gate(desync, hrec)
 	end
 
 	if success_detector(desync, crec) then
