@@ -51,7 +51,26 @@ on_off_function()
 contains()
 {
 	# check if substring $2 contains in $1
-	[ "${1#*$2}" != "$1" ]
+	# NB: `case` glob, not `[ "${1#*$2}" != "$1" ]`. In BusyBox ash the `#*`
+	# shortest-prefix strip is quadratic in ${#1}: on a Keenetic aarch64 one
+	# miss against a 29 KB nfqws2 option string costs 2.8-4.9 s, and the daemon
+	# start path runs five of them (3x has_bad_ws_options, 2x
+	# filter_apply_hostlist_target) = ~17 s of a 25 s service restart. Measured
+	# scaling is textbook O(n^2): 5.7 KB 0.12 s, 23 KB 1.91 s, 92 KB 31.67 s.
+	# `case` is a single match attempt: 0.00-0.01 s, verified identical results
+	# over 11 patterns. Quoting $2 additionally stops the needle being taken as
+	# a glob - option strings carry paths, and one containing [ or * matched
+	# spuriously before. starts_with() below already used this form.
+	#
+	# The empty-needle guard keeps EXACT parity with the old form, which
+	# reported "not found" for "" (its `#*` strip removed nothing, so the
+	# comparison was false). `case` would say "found" - defensible in the
+	# abstract, but this primitive is called by code paths we do not audit,
+	# and no caller passes an empty needle, so matching upstream beats being
+	# right. The glob divergence above IS intentional; this one buys nothing.
+	[ -n "$2" ] || return 1
+	case "$1" in *"$2"*) return 0 ;; esac
+	return 1
 }
 starts_with()
 {
