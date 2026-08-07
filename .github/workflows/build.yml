@@ -13,11 +13,22 @@ on:
     #   - 'mdig/**'
     #   - 'nfq2/**'
 
+# z2k: дефолтный токен умеет писать в репо, а сборочным джобам он не нужен —
+# release ниже поднимает contents: write сам. Диff с апстримом держим
+# минимальным (эти три блока — всё), MIPS-матрица не трогается.
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
 
   build-linux:
     name: Linux ${{ matrix.arch }}
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -197,6 +208,7 @@ jobs:
   build-android:
     name: Android ${{ matrix.abi }}
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     strategy:
       matrix:
         include:
@@ -312,6 +324,7 @@ jobs:
   build-freebsd:
     name: FreeBSD ${{ matrix.arch }}
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     env:
       DEPS_DIR: /workdir/deps
       LUAJIT_VER: 2.1
@@ -377,6 +390,7 @@ jobs:
   build-windows:
     name: Windows ${{ matrix.arch }}
     runs-on: windows-latest
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
