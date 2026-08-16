@@ -12,3 +12,5 @@ ipset/zapret-ip*.gz
 ipset/zapret-hosts*.txt
 ipset/zapret-hosts*.gz
 .vscode/
+# macOS кладёт его в каждый каталог, открытый в Finder
+.DS_Store
