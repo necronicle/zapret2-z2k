@@ -1837,8 +1837,6 @@ static void exithelp(void)
 #endif
 		" --ctrack-timeouts=S:E:F[:U]\t\t\t\t; internal conntrack timeouts for TCP SYN, ESTABLISHED, FIN stages, UDP timeout. default %u:%u:%u:%u\n"
 		" --ctrack-disable=[0|1]\t\t\t\t\t; 1 or no argument disables conntrack\n"
-		" --rst-filter=off|on|aggressive\t\t\t\t; z2k: drop DPI-injected fake TCP RST packets (3-check heuristic). off = default\n"
-		" --ipblock-detect=off|on\t\t\t\t\t; z2k: on 3rd ClientHello retrans, send RST to client so app retries on another IP. off = default\n"
 		" --payload-disable=[type[,type]]\t\t\t; do not discover these payload types. for available payload types see '--payload'. disable all if no argument.\n"
 		" --server=[0|1]\t\t\t\t\t\t; change multiple aspects of src/dst ip/port handling for incoming connections\n"
 		" --ipcache-lifetime=<int>\t\t\t\t; time in seconds to keep cached hop count and domain name (default %u). 0 = no expiration\n"
@@ -2002,9 +2000,6 @@ enum opt_indices {
 #endif
 	IDX_CTRACK_TIMEOUTS,
 	IDX_CTRACK_DISABLE,
-	IDX_RST_FILTER,
-	IDX_IPBLOCK_DETECT,
-	IDX_Z2K_SYN_DUP_MD5,
 	IDX_PAYLOAD_DISABLE,
 	IDX_SERVER,
 	IDX_IPCACHE_LIFETIME,
@@ -2116,9 +2111,6 @@ static const struct option long_options[] = {
 #endif
 	[IDX_CTRACK_TIMEOUTS] = {"ctrack-timeouts", required_argument, 0, 0},
 	[IDX_CTRACK_DISABLE] = {"ctrack-disable", optional_argument, 0, 0},
-	[IDX_RST_FILTER] = {"rst-filter", required_argument, 0, 0},
-	[IDX_IPBLOCK_DETECT] = {"ipblock-detect", required_argument, 0, 0},
-	[IDX_Z2K_SYN_DUP_MD5] = {"z2k-syn-dup-md5", required_argument, 0, 0},
 	[IDX_PAYLOAD_DISABLE] = {"payload-disable", optional_argument, 0, 0},
 	[IDX_SERVER] = {"server", optional_argument, 0, 0},
 	[IDX_IPCACHE_LIFETIME] = {"ipcache-lifetime", required_argument, 0, 0},
@@ -2494,37 +2486,6 @@ int main(int argc, char **argv)
 			break;
 		case IDX_CTRACK_DISABLE:
 			params.ctrack_disable = !optarg || atoi(optarg);
-			break;
-		case IDX_RST_FILTER:
-			if (!strcmp(optarg, "off") || !strcmp(optarg, "0"))
-				params.rst_filter = RSTFILTER_OFF;
-			else if (!strcmp(optarg, "on") || !strcmp(optarg, "1"))
-				params.rst_filter = RSTFILTER_ON;
-			else if (!strcmp(optarg, "aggressive"))
-				params.rst_filter = RSTFILTER_AGGRESSIVE;
-			else
-			{
-				DLOG_ERR("invalid rst-filter value. expected: off|on|aggressive\n");
-				exit_clean(1);
-			}
-			break;
-		case IDX_IPBLOCK_DETECT:
-			if (!strcmp(optarg, "off") || !strcmp(optarg, "0"))
-				params.z2k_ipblock_detect = Z2K_IPBLOCK_OFF;
-			else if (!strcmp(optarg, "on") || !strcmp(optarg, "1"))
-				params.z2k_ipblock_detect = Z2K_IPBLOCK_ON;
-			else
-			{
-				DLOG_ERR("invalid ipblock-detect value. expected: off|on\n");
-				exit_clean(1);
-			}
-			break;
-		case IDX_Z2K_SYN_DUP_MD5:
-			if (sscanf(optarg, "%u", &params.z2k_syn_dup_md5) != 1 || params.z2k_syn_dup_md5 > 64)
-			{
-				DLOG_ERR("invalid z2k-syn-dup-md5 value. expected: 0..64\n");
-				exit_clean(1);
-			}
 			break;
 		case IDX_SERVER:
 			params.server = !optarg || atoi(optarg);
