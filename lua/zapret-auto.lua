@@ -169,8 +169,35 @@ function standard_failure_detector(desync, crec)
 			if #desync.dis.payload>0 and arg.retrans and arg.maxseq>0 and seq<=arg.maxseq and (crec.retrans or 0)<arg.retrans then
 				if is_retransmission(desync) then
 					crec.retrans = crec.retrans and (crec.retrans+1) or 1
-					DLOG("standard_failure_detector: retransmission "..crec.retrans.."/"..arg.retrans)
-					trigger = crec.retrans>=arg.retrans
+					-- z2k: the retransmission tally lives on the HOST record, not on the
+					-- connection. A DPI box that kills every connection after a SINGLE
+					-- retransmission erased the evidence at connection close: each new
+					-- connection started a fresh crec, logged "1/2", and the threshold was
+					-- unreachable -- so a blocked host never rotated at all. Measured on
+					-- hetzner.com: one request, three connections (ports 61417/61422/61430),
+					-- one retransmission each, zero failures counted, zero rotations.
+					-- The BAR IS UNCHANGED: arg.retrans retransmissions still buy exactly one
+					-- failure and automate_failure_counter still needs arg.fails of them, so a
+					-- working host still costs arg.retrans*arg.fails retransmissions inside
+					-- one maxtime window. Only the scope changes. The tally ages out on the
+					-- same window as the failure counter so isolated losses cannot pile up
+					-- forever, and it is consumed on trigger so every failure pays full price.
+					local tally = crec.retrans
+					local hok, hrec = pcall(automate_host_record, desync)
+					if hok and hrec then
+						local tnow = os.time()
+						local maxtime = tonumber(desync.arg.time) or 60
+						if hrec.z2k_retrans_last and tnow>(hrec.z2k_retrans_last + maxtime) then
+							DLOG("standard_failure_detector: retrans tally reset, last was "..(tnow - hrec.z2k_retrans_last).."s ago")
+							hrec.z2k_retrans = nil
+						end
+						hrec.z2k_retrans = (hrec.z2k_retrans or 0) + 1
+						hrec.z2k_retrans_last = tnow
+						tally = hrec.z2k_retrans
+					end
+					DLOG("standard_failure_detector: retransmission "..tally.."/"..arg.retrans.." (conn "..crec.retrans..")")
+					trigger = tally>=arg.retrans
+					if trigger and hok and hrec then hrec.z2k_retrans = nil end
 					if trigger and arg.reset then
 						local dis = deepcopy(desync.dis)
 						dis.payload = nil
