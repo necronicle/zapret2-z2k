@@ -44,17 +44,12 @@
 #include <string.h>
 #include <stdlib.h>
 
-// Bit layout for the new modes. Must not collide with the existing
-// upstream FAKE_TLS_MOD_* values (0x01..0x10) defined in protocol.h.
-#define FAKE_TLS_MOD_Z2K_GREASE		0x00000020
-#define FAKE_TLS_MOD_Z2K_ALPN_FLOOD	0x00000040
-#define FAKE_TLS_MOD_Z2K_PSK		0x00000080
-#define FAKE_TLS_MOD_Z2K_KEYSHARE	0x00000100
-// r2 (2026-05-03) — extensions редко уже в blob → реальный JA3 distortion
-#define FAKE_TLS_MOD_Z2K_EARLYDATA	0x00000200
-#define FAKE_TLS_MOD_Z2K_PHA		0x00000400
-#define FAKE_TLS_MOD_Z2K_SCT		0x00000800
-#define FAKE_TLS_MOD_Z2K_DELEGCRED	0x00001000
+// Раскладка битов FAKE_TLS_MOD_Z2K_* живёт в protocol.h — там же, где
+// upstream'овые FAKE_TLS_MOD_* (0x01..0x10), с которыми она не должна
+// пересекаться, и оттуда её берёт protocol.c. Здесь она когда-то была
+// объявлена ВТОРОЙ раз теми же значениями: компилятор ругался на
+// переопределение восьми макросов, а главное — два места пришлось бы держать
+// в согласии руками, и следующий бит разошёлся бы молча.
 
 // --- Byte helpers ---------------------------------------------------------
 
