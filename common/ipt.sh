@@ -240,7 +240,15 @@ ipt_port_ipset()
 ipt_first_packets()
 {
 	# $1 - packet count
-	[ -n "$1" -a "$1" != keepalive ] && [ "$1" -ge 1 ] && echo "$ipt_connbytes 1:$1"
+	# 0:N, а не 1:N. На ядре Keenetic первый ОТВЕТНЫЙ пакет (SYN-ACK) проходит
+	# mangle FORWARD/INPUT со счётчиком conntrack ещё 0, и 1:N его не отдаёт в
+	# очередь. Движок тогда не знает окно сервера, и его защита «reasm cancelled
+	# because server window size is smaller» молчит: сервер с окном 1448
+	# (анти-DDoS reg.ru) держит клиент на первом сегменте ClientHello, а nfqws
+	# держит сегмент до сборки — дедлок до таймаута. Замер 11.09.2026 на
+	# Keenetic: правило 1:50 на SYN-ACK — 0 пакетов, 0:50 — все. Семантика
+	# «первые N пакетов» не меняется.
+	[ -n "$1" -a "$1" != keepalive ] && [ "$1" -ge 1 ] && echo "$ipt_connbytes 0:$1"
 }
 ipt_do_nfqws_in_out()
 {
