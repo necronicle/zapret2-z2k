@@ -632,11 +632,9 @@ nft_first_packets()
 	# $1 - packet count
 	[ -n "$1" -a "$1" != keepalive ] && [ "$1" -ge 1 ] &&
 	{
-		if [ "$1" = 1 ] ; then
-			echo "$nft_connbytes 1"
-		else
-			echo "$nft_connbytes 1-$1"
-		fi
+		# 0-N по той же причине, что и в ipt_first_packets (common/ipt.sh):
+		# первый ответный пакет может прийти со счётчиком 0.
+		echo "$nft_connbytes 0-$1"
 	}
 }
 
