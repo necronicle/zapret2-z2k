@@ -82,44 +82,6 @@ function automate_conn_record(desync)
 	return desync.track.lua_state.automate
 end
 
--- z2k: ВЕТО ПО ДОСТАВЛЕННОМУ КОНТЕНТУ.
---
--- Детектор считает провалом входящий RST в пределах inseq. Для по-настоящему
--- заблокированного хоста это верно, но у живого сайта с веером параллельных
--- соединений RST прилетают постоянно и о стратегии не сообщают НИЧЕГО.
--- Замер 30.08 на роутере владельца: instagram.com|4 развернулся по трём
--- подряд `incoming RST s1 in range s26000`, и ровно такие же RST продолжили
--- сыпаться на новом плече — 389 штук за окно лога. Сайт при этом отдавал
--- 404831 байт и на старом плече, и на новом. То есть ротация была ложной, а
--- сигнал, её вызвавший, от стратегии не зависел вовсе.
---
--- Уравновесить провалы успехами нечем: в этой сборке засчёт успехов не
--- работает (за 128973 строки лога — ноль записей `success offset`), поэтому
--- условие ротации выродилось в голое `failure_counter >= fails`.
---
--- Отсюда вето, а не встречный счётчик: хост, который за последние
--- Z2K_CONTENT_GATE_WINDOW секунд отдал больше Z2K_CONTENT_GATE_BYTES байт,
--- очевидно работает, и разворачивать его по шумным RST нельзя. Хост, который
--- не отдаёт ничего, ротируется как и раньше — вето для него не взводится.
--- Байты берутся у ЯВНОЙ серверной подтаблицы (`pos.server` — «пакеты от
--- сервера», docs/manual.md), а не через direct/reverse: последние лишь ссылки,
--- и какая из них серверная, зависит от направления текущего пакета.
-Z2K_CONTENT_GATE_BYTES  = tonumber(os.getenv("Z2K_CONTENT_GATE_BYTES"))  or 16384
-Z2K_CONTENT_GATE_WINDOW = tonumber(os.getenv("Z2K_CONTENT_GATE_WINDOW")) or 300
-
-function z2k_content_gate(desync, hrec)
-	if not hrec or not desync.track or not desync.track.pos then return end
-	local srv = desync.track.pos.server
-	if not srv then return end
-	local b = pos_get_pos(srv, 'b')
-	if b and b > Z2K_CONTENT_GATE_BYTES then
-		if not hrec.content_seen_last and b_debug then
-			DLOG("automate: content gate set (server sent "..b.."B > "..Z2K_CONTENT_GATE_BYTES..")")
-		end
-		hrec.content_seen_last = os.time()
-	end
-end
-
 -- counts failure, optionally (if crec is given) prevents dup failure counts in a single connection
 -- if 'maxtime' between failures is exceeded then failure count is reset
 -- return true if threshold ('fails') is reached
@@ -144,15 +106,6 @@ function automate_failure_counter(hrec, crec, fails, maxtime)
 		hrec.failure_time_last = tnow
 		if b_debug then DLOG("automate: failure counter "..hrec.failure_counter..(fails and ('/'..fails) or '')) end
 		if fails and hrec.failure_counter>=fails then
-			-- z2k: живой хост не разворачиваем по шумным RST (см. выше).
-			-- Счётчик обнуляем в обоих исходах: иначе следующий же провал
-			-- снова упрётся в порог и вето печаталось бы на каждый пакет.
-			local _now = os.time()
-			if hrec.content_seen_last and _now <= (hrec.content_seen_last + Z2K_CONTENT_GATE_WINDOW) then
-				DLOG("automate: rotation vetoed, host delivered content "..(_now - hrec.content_seen_last).."s ago")
-				hrec.failure_counter = nil
-				return false
-			end
 			hrec.failure_counter = nil -- reset counter
 			return true
 		end
@@ -216,35 +169,8 @@ function standard_failure_detector(desync, crec)
 			if #desync.dis.payload>0 and arg.retrans and arg.maxseq>0 and seq<=arg.maxseq and (crec.retrans or 0)<arg.retrans then
 				if is_retransmission(desync) then
 					crec.retrans = crec.retrans and (crec.retrans+1) or 1
-					-- z2k: the retransmission tally lives on the HOST record, not on the
-					-- connection. A DPI box that kills every connection after a SINGLE
-					-- retransmission erased the evidence at connection close: each new
-					-- connection started a fresh crec, logged "1/2", and the threshold was
-					-- unreachable -- so a blocked host never rotated at all. Measured on
-					-- hetzner.com: one request, three connections (ports 61417/61422/61430),
-					-- one retransmission each, zero failures counted, zero rotations.
-					-- The BAR IS UNCHANGED: arg.retrans retransmissions still buy exactly one
-					-- failure and automate_failure_counter still needs arg.fails of them, so a
-					-- working host still costs arg.retrans*arg.fails retransmissions inside
-					-- one maxtime window. Only the scope changes. The tally ages out on the
-					-- same window as the failure counter so isolated losses cannot pile up
-					-- forever, and it is consumed on trigger so every failure pays full price.
-					local tally = crec.retrans
-					local hok, hrec = pcall(automate_host_record, desync)
-					if hok and hrec then
-						local tnow = os.time()
-						local maxtime = tonumber(desync.arg.time) or 60
-						if hrec.z2k_retrans_last and tnow>(hrec.z2k_retrans_last + maxtime) then
-							DLOG("standard_failure_detector: retrans tally reset, last was "..(tnow - hrec.z2k_retrans_last).."s ago")
-							hrec.z2k_retrans = nil
-						end
-						hrec.z2k_retrans = (hrec.z2k_retrans or 0) + 1
-						hrec.z2k_retrans_last = tnow
-						tally = hrec.z2k_retrans
-					end
-					DLOG("standard_failure_detector: retransmission "..tally.."/"..arg.retrans.." (conn "..crec.retrans..")")
-					trigger = tally>=arg.retrans
-					if trigger and hok and hrec then hrec.z2k_retrans = nil end
+					DLOG("standard_failure_detector: retransmission "..crec.retrans.."/"..arg.retrans)
+					trigger = crec.retrans>=arg.retrans
 					if trigger and arg.reset then
 						local dis = deepcopy(desync.dis)
 						dis.payload = nil
@@ -349,9 +275,6 @@ end
 -- increases counter if failure is detected
 -- returns true if failure counter exceeds threshold
 function automate_failure_check(desync, hrec, crec)
-	-- Гейт взводим ДО выхода по nocheck: соединение, уже признанное
-	-- успешным, продолжает носить контент, и он тоже считается.
-	z2k_content_gate(desync, hrec)
 	if crec.nocheck then return false end
 
 	local failure_detector, success_detector
