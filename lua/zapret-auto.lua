@@ -74,12 +74,72 @@ function automate_host_record(desync)
 	return autostate[askey][hostkey]
 end
 -- per-connection storage
-function automate_conn_record(desync)
+function automate_conn_record(desync, hrec)
 	if not desync.track then return nil end
-	if not desync.track.lua_state.automate then
-		desync.track.lua_state.automate = {}
+	local state = desync.track.lua_state
+	-- Profiles/host keys can change after discovering SNI. Do not carry a
+	-- terminal verdict or parser state into a different host record.
+	if hrec then
+		state.automate_hosts = state.automate_hosts or {}
+		state.automate_hosts[hrec] = state.automate_hosts[hrec] or {}
+		state.automate = state.automate_hosts[hrec]
+	else
+		state.automate = state.automate or {}
 	end
-	return desync.track.lua_state.automate
+	return state.automate
+end
+
+-- Generation is an identity token, not a strategy number: 1 -> 2 -> 1 must
+-- not revive old attempts. Also detects external/manual strategy changes.
+function circular_sync_generation(hrec)
+	if not hrec.generation or hrec.generation_strategy ~= hrec.nstrategy then
+		hrec.generation = {}
+		hrec.generation_strategy = hrec.nstrategy
+		hrec.failure_counter = nil
+		hrec.failure_time_last = nil
+	end
+end
+
+function circular_bind_attempt(hrec, crec)
+	circular_sync_generation(hrec)
+	if not crec.generation then
+		crec.host_record = hrec
+		crec.generation = hrec.generation
+		crec.nstrategy = hrec.nstrategy
+	end
+end
+
+function circular_attempt_current(hrec, crec)
+	circular_sync_generation(hrec)
+	return crec.host_record == hrec and crec.generation == hrec.generation
+		and crec.nstrategy == hrec.nstrategy
+end
+
+-- The only automatic strategy transition, shared by packet and timer results.
+function circular_rotate(hrec)
+	if not hrec.ctstrategy or hrec.ctstrategy < 1 or hrec.final == hrec.nstrategy then return false end
+	hrec.nstrategy = (hrec.nstrategy % hrec.ctstrategy) + 1
+	-- Even a one-strategy pool starts a new generation on a completed quorum.
+	hrec.generation = nil
+	circular_sync_generation(hrec)
+	DLOG("circular: rotate strategy to " .. hrec.nstrategy)
+	if type(hrec.on_strategy_changed) == "function" then pcall(hrec.on_strategy_changed, hrec) end
+	return true
+end
+
+function automate_failure_result(hrec, crec, arg)
+	if crec.nocheck or not circular_attempt_current(hrec, crec)
+		or hrec.final == hrec.nstrategy then return false end
+	crec.nocheck = true
+	return automate_failure_counter(hrec, crec, tonumber(arg.fails) or 3, tonumber(arg.time) or 60)
+end
+
+-- Timers submit a result through the same attribution, terminal-state and
+-- quorum checks as packet callbacks. They never mutate nstrategy themselves.
+function circular_report_failure(hrec, crec, arg)
+	if type(hrec.before_async_result) == "function" and not pcall(hrec.before_async_result, hrec) then return false end
+	if automate_failure_result(hrec, crec, arg) then return circular_rotate(hrec) end
+	return false
 end
 
 -- counts failure, optionally (if crec is given) prevents dup failure counts in a single connection
@@ -154,7 +214,7 @@ end
 --   udp too much out with too few in
 -- arg: maxseq=<rseq> - tcp: test retransmissions only within this relative sequence. default is 32K
 -- arg: retrans=N - tcp: retrans count threshold. default is 3
--- arg: reset - send RST to retransmitter to break long wait
+-- arg: reset - dispatcher sends RST only after accepting retransmission failure
 -- arg: inseq=<rseq> - tcp: maximum relative sequence number to treat incoming RST as DPI reset. default is 4K
 -- arg: no_http_redirect - tcp: disable http_reply dpi redirect trigger
 -- arg: no_rst - tcp: disable incoming RST trigger
@@ -166,24 +226,12 @@ function standard_failure_detector(desync, crec)
 	if desync.dis.tcp then
 		local seq = pos_get(desync,'s')
 		if desync.outgoing then
-			if #desync.dis.payload>0 and arg.retrans and arg.maxseq>0 and seq<=arg.maxseq and (crec.retrans or 0)<arg.retrans then
+			if #desync.dis.payload>0 and arg.retrans and arg.retrans>0 and arg.maxseq>0 and seq<=arg.maxseq then
 				if is_retransmission(desync) then
-					crec.retrans = crec.retrans and (crec.retrans+1) or 1
+					crec.retrans = math.min((crec.retrans or 0) + 1, arg.retrans)
 					DLOG("standard_failure_detector: retransmission "..crec.retrans.."/"..arg.retrans)
 					trigger = crec.retrans>=arg.retrans
-					if trigger and arg.reset then
-						local dis = deepcopy(desync.dis)
-						dis.payload = nil
-						dis_reverse(dis)
-						dis.tcp.th_flags = TH_RST
-						dis.tcp.th_win = desync.track and desync.track.pos.reverse.tcp.winsize or 64
-						dis.tcp.options = nil
-						if dis.ip6 then
-							dis.ip6.ip6_flow = (desync.track and desync.track.pos.reverse.ip6_flow) and desync.track.pos.reverse.ip6_flow or 0x60000000;
-						end
-						DLOG("standard_failure_detector: sending RST to retransmitter")
-						rawsend_dissect(dis, {ifout = desync.ifin})
-					end
+					crec.retrans_failure = trigger
 				end
 			end
 		else
@@ -243,6 +291,9 @@ end
 function standard_success_detector(desync, crec)
 	local arg = standard_detector_defaults(desync.arg)
 	if desync.dis.tcp then
+		if not desync.dis.payload or #desync.dis.payload == 0
+			or bitand(desync.dis.tcp.th_flags, TH_RST + TH_FIN) ~= 0
+			or is_retransmission(desync) then return false end
 		local seq = pos_get(desync,'s')
 		if desync.outgoing then
 			if arg.maxseq>0 and seq>arg.maxseq then
@@ -274,41 +325,49 @@ end
 -- resets counter if success is detected
 -- increases counter if failure is detected
 -- returns true if failure counter exceeds threshold
+local function automate_reset_client(desync)
+	local dis = deepcopy(desync.dis)
+	dis.payload = nil
+	dis_reverse(dis)
+	dis.tcp.th_flags = TH_RST
+	dis.tcp.th_win = desync.track.pos.reverse.tcp.winsize or 64
+	dis.tcp.options = nil
+	if dis.ip6 then dis.ip6.ip6_flow = desync.track.pos.reverse.ip6_flow or 0x60000000 end
+	DLOG("automate: sending RST after accepted retransmission failure")
+	rawsend_dissect(dis, {ifout = desync.ifin})
+end
+
 function automate_failure_check(desync, hrec, crec)
-	if crec.nocheck then return false end
-
-	local failure_detector, success_detector
-	if desync.arg.failure_detector then
-		if type(_G[desync.arg.failure_detector])~="function" then
-			error("automate: invalid failure detector function '"..desync.arg.failure_detector.."'")
-		end
-		failure_detector = _G[desync.arg.failure_detector]
-	else
-		failure_detector = standard_failure_detector
+	circular_bind_attempt(hrec, crec)
+	if crec.nocheck or not circular_attempt_current(hrec, crec) then return false end
+	local failure_detector = desync.arg.failure_detector and _G[desync.arg.failure_detector] or standard_failure_detector
+	local success_detector = desync.arg.success_detector and _G[desync.arg.success_detector] or standard_success_detector
+	if type(failure_detector) ~= "function" or (desync.arg.failure_detector and not _G[desync.arg.failure_detector]) then
+		error("automate: invalid failure detector function '" .. tostring(desync.arg.failure_detector) .. "'")
 	end
-	if desync.arg.success_detector then
-		if type(_G[desync.arg.success_detector])~="function" then
-			error("automate: invalid success detector function '"..desync.arg.success_detector.."'")
-		end
-		success_detector = _G[desync.arg.success_detector]
-	else
-		success_detector = standard_success_detector
+	if type(success_detector) ~= "function" or (desync.arg.success_detector and not _G[desync.arg.success_detector]) then
+		error("automate: invalid success detector function '" .. tostring(desync.arg.success_detector) .. "'")
 	end
 
-	if success_detector(desync, crec) then
+	-- Classify first; no network side effects until the verdict is accepted.
+	-- Optional second return: pending defers byte/count success while parsing;
+	-- neutral ends observation without rewarding or penalizing the strategy.
+	crec.retrans_failure = nil
+	local failed, outcome = failure_detector(desync, crec)
+	if failed then
+		local rotate = automate_failure_result(hrec, crec, desync.arg)
+		if crec.failure and desync.arg.reset and crec.retrans_failure and desync.dis.tcp then
+			automate_reset_client(desync)
+		end
+		return rotate
+	end
+	if outcome == "neutral" then
+		crec.neutral, crec.nocheck = true, true
+	elseif outcome ~= "pending" and (outcome == "success" or success_detector(desync, crec)) then
 		crec.nocheck = true
 		DLOG("automate: success detected")
 		automate_failure_counter_reset(hrec)
-		return false
 	end
-	if failure_detector(desync, crec) then
-		crec.nocheck = true
-		DLOG("automate: failure detected")
-		local fails = tonumber(desync.arg.fails) or 3
-		local maxtime = tonumber(desync.arg.time) or 60
-		return automate_failure_counter(hrec, crec, fails, maxtime)
-	end
-
 	return false
 end
 
@@ -372,28 +431,28 @@ function circular(ctx, desync)
 	if hrec.ctstrategy==0 then
 		error("circular: add strategy=N tag argument to each following instance ! N must start from 1 and increment")
 	end
-	if not hrec.nstrategy then
+	if not hrec.nstrategy or hrec.nstrategy < 1 or hrec.nstrategy > hrec.ctstrategy then
 		DLOG("circular: start from strategy 1")
 		hrec.nstrategy = 1
 	end
 
+	local crec = automate_conn_record(desync, hrec)
+	circular_bind_attempt(hrec, crec)
 	local verdict = VERDICT_PASS
-	if hrec.final~=hrec.nstrategy then
-		local crec = automate_conn_record(desync)
-		if automate_failure_check(desync, hrec, crec) then
-			hrec.nstrategy = (hrec.nstrategy % hrec.ctstrategy) + 1
-			DLOG("circular: rotate strategy to "..hrec.nstrategy)
-			if hrec.nstrategy == hrec.final then
-				DLOG("circular: final strategy "..hrec.final.." reached. will rotate no more.")
-			end
-		end
+	if hrec.final ~= hrec.nstrategy then
+		if automate_failure_check(desync, hrec, crec) then circular_rotate(hrec) end
+	else
+		-- An explicit pin/final overrides an existing flow, but that flow must
+		-- never later contribute a verdict for its previous processing.
+		crec.nstrategy = hrec.nstrategy
+		crec.nocheck, crec.neutral = true, true
 	end
 
 	DLOG("circular: current strategy "..hrec.nstrategy)
 	while true do
 		local instance = plan_instance_pop(desync)
 		if not instance then break end
-		if instance.arg.strategy and tonumber(instance.arg.strategy)==hrec.nstrategy then
+		if instance.arg.strategy and tonumber(instance.arg.strategy)==crec.nstrategy then
 			verdict = plan_instance_execute(desync, verdict, instance)
 		end
 	end
