@@ -4450,9 +4450,16 @@ function automate_failure_check(desync, hrec, crec)
 - arg: success_detector - the name of the success detector function. Defaults to `standard_success_detector` if not specified.
 - arg: failure_detector - the name of the failure detector function. Defaults to `standard_failure_detector` if not specified.
 - arg: fails - the target failure counter value. Default is 3.
-- arg: maxtime - the maximum time in seconds between failures before the counter resets. Default is 60 seconds.
+- arg: time - the maximum time in seconds between failures before the counter resets. Default is 60 seconds.
 
 This function maintains the failure counter by invoking the success and failure detectors. It returns `true` if the counter reaches the target value. The counter resets automatically in this case.
+
+The fork evaluates failure first, before success or network side effects.
+A failure detector may return a second value with `false`: `"pending"` defers
+the success detector, `"neutral"` ends observation without changing the host
+counter, and `"success"` confirms success and resets that counter. Without a
+second value the configured success detector runs normally. Each connection
+can contribute only one terminal result, and only to its current generation.
 
 ### standard_success_detector
 
@@ -4465,10 +4472,14 @@ function standard_success_detector(desync, crec)
 
 - crec - [stream storage](#automate_conn_record)
 - arg: maxseq - the outgoing relative sequence threshold for marking a success. Default is 32768. Purpose: Sufficient data has been sent without the stream stalling due to blocking.
-- arg: inseq - the incoming relative sequence threshold for marking a success. Default is 4096. Purpose: The peer has sent enough data to ensure it is not a DPI-generated response.
-- arg: udp_out, udp_in - more than `udp_in` UDP packets received, provided that `udp_out` > 0. Purpose: The peer has sent enough data to ensure it is not a DPI-generated response.
+- arg: inseq - the incoming relative sequence threshold for marking a success. Default is 4096. Purpose: A heuristic indication of transport progress.
+- arg: udp_out, udp_in - more than `udp_in` UDP packets received, provided that `udp_out` > 0. Purpose: A heuristic indication of transport progress.
 
 Standard success detector.
+
+TCP success requires a non-empty, non-retransmitted data packet without RST
+or FIN, whose starting relative sequence is strictly above the threshold.
+Neither byte progress nor UDP packet counts prove application success.
 
 ### standard_failure_detector
 
@@ -4479,7 +4490,7 @@ function standard_failure_detector(desync, crec)
 - crec - [stream storage](#automate_conn_record)
 - arg: maxseq - count retransmissions within outgoing relative sequences from 1 to `maxseq`. Default is 32768.
 - arg: retrans - consider it a failure if there are at least `retrans` retransmissions. Default is 3.
-- arg: reset - send an RST to the retransmitter to terminate long wait times.
+- arg: reset - `automate_failure_check` sends RST after accepting a retransmission failure.
 - arg: inseq - treat RSTs and HTTP redirects within incoming relative sequences from 1 to `inseq` as failures. Default is 4096.
 - arg: no_rst - do not treat RST as a failure.
 - arg: no_http_redirect - do not treat HTTP redirects as failures.
@@ -4488,6 +4499,10 @@ function standard_failure_detector(desync, crec)
 Standard failure detector.
 
 DPI-based HTTP redirects are defined the same way as in [autohostlists](#autohostlist-failure-detector).
+
+The detector itself does not send packets; it records the retransmission
+reason in `crec.retrans_failure`. The dispatcher applies `reset` only after
+accepting the failure. `retrans=0` disables retransmission failures.
 
 ## Orchestrators
 
@@ -4503,6 +4518,22 @@ function circular(ctx, desync)
 - arg: (standard detector only) [standard failure detector](#standard_failure_detector)
 
 This orchestrator tracks failures and cycles through strategies once the failure counter reaches the `fails` target. All subsequent instances are labeled with a "strategy" argument containing the strategy number, starting from 1. Instances without a "strategy" argument are not called by `circular`. Strategy numbers must be continuous from 1 to the last; gaps are not allowed and will trigger an error. If any instance of strategy N includes a "final" argument, that strategy becomes the last one-further cycling is blocked.
+
+In this fork, automatic rotation selects the strategy for **new connections**.
+An existing connection keeps its original strategy. Its observation is scoped
+to the host record and an identity token for that generation; old failures,
+successes and timers cannot affect a new generation, even after wraparound.
+An explicit final/pin overrides an existing connection and ends its observation
+neutrally. `automate_conn_record(desync, hrec)` provides scoped flow storage;
+`track.lua_state.automate` remains an alias for the current record.
+
+Asynchronous detectors must submit `circular_report_failure(hrec, crec, arg)`
+instead of modifying `nstrategy`. It validates attribution, terminal state,
+final pins and the `fails`/`time` quorum. `circular_rotate(hrec)` is the shared
+transition. Optional host hooks `before_async_result(hrec)` and
+`on_strategy_changed(hrec)` support external-state reconciliation and persistence.
+An exception in the former rejects the asynchronous result. Manual resets to
+the same number must also invalidate `hrec.generation`.
 
 Usage example:
 
