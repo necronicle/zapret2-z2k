@@ -635,6 +635,19 @@ static void reasm_client_fin(t_ctrack *ctrack)
 {
 	reasm_client_stop(ctrack, "reassemble session finished\n");
 }
+// z2k: сброс сборки с ВЫБРАСЫВАНИЕМ задержанных оригиналов. reasm_client_cancel()
+// отправляет их в сеть как есть (send_delayed) — для ClientHello это утечка SNI
+// мимо десинка. Здесь оригиналы не нужны: клиент их уже ретрансмитит сам.
+static void reasm_client_cancel_discard(t_ctrack *ctrack)
+{
+	if (ctrack)
+	{
+		ReasmClear(&ctrack->reasm_client);
+		ctrack->reasm_client_payload = L7P_UNKNOWN;
+		rawpacket_queue_destroy(&ctrack->delayed);
+		DLOG("reassemble session cancelled, delayed packets discarded\n");
+	}
+}
 
 
 static uint8_t ct_new_postnat_fix(const t_ctrack *ctrack, const struct dissect *dis, uint8_t *mod_pkt, size_t *len_mod_pkt)
@@ -1620,24 +1633,45 @@ static uint8_t dpi_desync_tcp_packet_play(
 
 				if (!ReasmIsEmpty(&ps.ctrack->reasm_client))
 				{
-					if (rawpacket_queue(&ps.ctrack->delayed, &ps.dst, fwmark, desync_fwmark, ifin, ifout, dis->data_pkt, dis->len_pkt, dis->len_payload, &ps.ctrack->pos, false))
+					// z2k: ретрансмиссия при НЕЗАВЕРШЁННОЙ сборке означает, что остальные
+					// сегменты до нас не дошли и не дойдут (аппаратный fastpath увёл поток,
+					// окно без правил PPE после регена NDM, потеря в LAN). Апстрим ставит
+					// повтор в очередь и дропает — до RAW_PACKET_QUEUE_DELAYED_MAX=64 раз,
+					// клиент сдаётся раньше, соединение висит без отката. Сбрасываем сборку,
+					// оригиналы выбрасываем (их отправка как есть раскрыла бы SNI) и десинкаем
+					// этот сегмент один: SNI почти всегда в первом, а клиент дошлёт остальное
+					// сам после ACK. Цена — один RTO вместо зависания.
+					// Сравнение с nfqws2-keenetic (--fastpath-workaround): взята только эта
+					// часть; ACK-пустышки вместо DROP по исходникам ядра Keenetic на
+					// биндинг fastpath не влияют (fast_bind_reached считает пакеты, не вердикты).
+					if (is_retransmission(&ps.ctrack->pos.client))
 					{
-						DLOG("DELAY desync until reasm is complete (#%u)\n", rawpacket_queue_count(&ps.ctrack->delayed));
+						DLOG("retransmission while reasm is incomplete : further segments bypass us. cancel reasm, single segment desync\n");
+						reasm_client_cancel_discard(ps.ctrack);
+						rdata_payload = dis->data_payload;
+						rlen_payload = dis->len_payload;
 					}
 					else
 					{
-						// likely exceeded packet limit or unlikely out of memory
-						DLOG_ERR("rawpacket_queue failed !\n");
-						reasm_client_cancel(ps.ctrack);
-						ps.l7payload = L7P_UNKNOWN; // middle packet may be not L7P_TLS_CLIENT_HELLO
-						goto rediscover;
+						if (rawpacket_queue(&ps.ctrack->delayed, &ps.dst, fwmark, desync_fwmark, ifin, ifout, dis->data_pkt, dis->len_pkt, dis->len_payload, &ps.ctrack->pos, false))
+						{
+							DLOG("DELAY desync until reasm is complete (#%u)\n", rawpacket_queue_count(&ps.ctrack->delayed));
+						}
+						else
+						{
+							// likely exceeded packet limit or unlikely out of memory
+							DLOG_ERR("rawpacket_queue failed !\n");
+							reasm_client_cancel(ps.ctrack);
+							ps.l7payload = L7P_UNKNOWN; // middle packet may be not L7P_TLS_CLIENT_HELLO
+							goto rediscover;
+						}
+						if (ReasmIsFull(&ps.ctrack->reasm_client))
+						{
+							replay_queue(&ps.ctrack->delayed);
+							reasm_client_fin(ps.ctrack);
+						}
+						return VERDICT_DROP;
 					}
-					if (ReasmIsFull(&ps.ctrack->reasm_client))
-					{
-						replay_queue(&ps.ctrack->delayed);
-						reasm_client_fin(ps.ctrack);
-					}
-					return VERDICT_DROP;
 				}
 			}
 			ps.bHaveHost = TLSHelloExtractHost(rdata_payload, rlen_payload, ps.host, sizeof(ps.host), true);
