@@ -3,17 +3,82 @@ IPSET_EXCLUDE="-m set ! --match-set nozapret"
 IPSET_EXCLUDE6="-m set ! --match-set nozapret6"
 IPSET_PORTS_NAME=zport
 
+_ipt_lock()
+{
+	local lock="${Z2K_IPT_LOCK:-/tmp/zapret2-iptables.lock}" owner waited=0
+	while ! mkdir "$lock" 2>/dev/null; do
+		owner="$(cat "$lock/pid" 2>/dev/null)"
+		case "$owner" in
+			''|*[!0-9]*) ;;
+			*)
+				if ! kill -0 "$owner" 2>/dev/null; then
+					rm -f "$lock/pid" 2>/dev/null && rmdir "$lock" 2>/dev/null
+					continue
+				fi
+				;;
+		esac
+		[ "$waited" -lt "${Z2K_IPT_LOCK_TIMEOUT:-30}" ] || return 1
+		sleep 1
+		waited=$((waited + 1))
+	done
+	echo $$ > "$lock/pid" 2>/dev/null || {
+		rmdir "$lock" 2>/dev/null
+		return 1
+	}
+}
+_ipt_unlock()
+{
+	local lock="${Z2K_IPT_LOCK:-/tmp/zapret2-iptables.lock}"
+	rm -f "$lock/pid" 2>/dev/null
+	rmdir "$lock" 2>/dev/null
+}
+
 ipt()
 {
-	iptables $FW_EXTRA_PRE -C "$@" $FW_EXTRA_POST >/dev/null 2>/dev/null || iptables $FW_EXTRA_PRE -I "$@" $FW_EXTRA_POST
+	local rc
+	_ipt_lock || return 1
+	iptables $FW_EXTRA_PRE -w -C "$@" $FW_EXTRA_POST >/dev/null 2>/dev/null
+	rc=$?
+	case "$rc" in
+		0) ;;
+		1) iptables $FW_EXTRA_PRE -w -I "$@" $FW_EXTRA_POST; rc=$? ;;
+	esac
+	_ipt_unlock
+	return "$rc"
 }
 ipta()
 {
-	iptables $FW_EXTRA_PRE -C "$@" $FW_EXTRA_POST >/dev/null 2>/dev/null || iptables $FW_EXTRA_PRE -A "$@" $FW_EXTRA_POST
+	local rc
+	_ipt_lock || return 1
+	iptables $FW_EXTRA_PRE -w -C "$@" $FW_EXTRA_POST >/dev/null 2>/dev/null
+	rc=$?
+	case "$rc" in
+		0) ;;
+		1) iptables $FW_EXTRA_PRE -w -A "$@" $FW_EXTRA_POST; rc=$? ;;
+	esac
+	_ipt_unlock
+	return "$rc"
 }
 ipt_del()
 {
-	iptables $FW_EXTRA_PRE -C "$@" $FW_EXTRA_POST >/dev/null 2>/dev/null && iptables $FW_EXTRA_PRE -D "$@" $FW_EXTRA_POST
+	local rc deleted=0
+	_ipt_lock || return 1
+	while :; do
+		iptables $FW_EXTRA_PRE -w -C "$@" $FW_EXTRA_POST >/dev/null 2>/dev/null
+		rc=$?
+		case "$rc" in
+			0)
+				iptables $FW_EXTRA_PRE -w -D "$@" $FW_EXTRA_POST
+				rc=$?
+				[ "$rc" = 0 ] || break
+				deleted=1
+				;;
+			1) [ "$deleted" = 0 ] || rc=0; break ;;
+			*) break ;;
+		esac
+	done
+	_ipt_unlock
+	return "$rc"
 }
 ipt_add_del()
 {
@@ -25,15 +90,50 @@ ipta_add_del()
 }
 ipt6()
 {
-	ip6tables -C "$@" >/dev/null 2>/dev/null || ip6tables -I "$@"
+	local rc
+	_ipt_lock || return 1
+	ip6tables -w -C "$@" >/dev/null 2>/dev/null
+	rc=$?
+	case "$rc" in
+		0) ;;
+		1) ip6tables -w -I "$@"; rc=$? ;;
+	esac
+	_ipt_unlock
+	return "$rc"
 }
 ipt6a()
 {
-	ip6tables -C "$@" >/dev/null 2>/dev/null || ip6tables -A "$@"
+	local rc
+	_ipt_lock || return 1
+	ip6tables -w -C "$@" >/dev/null 2>/dev/null
+	rc=$?
+	case "$rc" in
+		0) ;;
+		1) ip6tables -w -A "$@"; rc=$? ;;
+	esac
+	_ipt_unlock
+	return "$rc"
 }
 ipt6_del()
 {
-	ip6tables -C "$@" >/dev/null 2>/dev/null && ip6tables -D "$@"
+	local rc deleted=0
+	_ipt_lock || return 1
+	while :; do
+		ip6tables -w -C "$@" >/dev/null 2>/dev/null
+		rc=$?
+		case "$rc" in
+			0)
+				ip6tables -w -D "$@"
+				rc=$?
+				[ "$rc" = 0 ] || break
+				deleted=1
+				;;
+			1) [ "$deleted" = 0 ] || rc=0; break ;;
+			*) break ;;
+		esac
+	done
+	_ipt_unlock
+	return "$rc"
 }
 ipt6_add_del()
 {
